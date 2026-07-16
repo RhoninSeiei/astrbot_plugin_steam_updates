@@ -129,6 +129,7 @@ class SteamUpdatePush(Star):
     async def initialize(self):
         await self._ensure_http_client()
         self._cancel_legacy_poll_tasks()
+        self._release_orphan_poll_lock_fds()
         self._claim_poll_instance()
         self._poll_task = asyncio.create_task(self._poll_loop())
 
@@ -180,6 +181,74 @@ class SteamUpdatePush(Star):
             os.close(fd)
         except Exception as exc:
             self._log_warn("poll", "poll lock close failed", error=exc)
+
+    def _release_orphan_poll_lock_fds(self) -> int:
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.exists():
+            return 0
+        try:
+            target = self._poll_lock_path.resolve(strict=False)
+        except Exception:
+            target = Path(os.path.abspath(str(self._poll_lock_path)))
+
+        current_fd = getattr(self, "_poll_lock_fd", None)
+        closed = 0
+        try:
+            fd_entries = list(fd_dir.iterdir())
+        except Exception as exc:
+            self._log_warn("poll", "poll lock fd scan failed", error=exc)
+            return 0
+
+        for entry in fd_entries:
+            try:
+                fd = int(entry.name)
+            except ValueError:
+                continue
+            if current_fd is not None and fd == current_fd:
+                continue
+            try:
+                link_target = Path(os.readlink(entry))
+            except OSError:
+                continue
+            try:
+                resolved = link_target.resolve(strict=False)
+            except Exception:
+                resolved = Path(os.path.abspath(str(link_target)))
+            if resolved != target:
+                continue
+            try:
+                os.close(fd)
+                closed += 1
+            except OSError:
+                continue
+            except Exception as exc:
+                self._log_warn("poll", "orphan poll lock fd close failed", fd=fd, error=exc)
+        if closed:
+            self._log_warn("poll", "closed orphan poll lock fds", count=closed)
+        return closed
+
+    def _stop_legacy_poll_owner(self, owner: Any) -> None:
+        stop_event = getattr(owner, "_stop_event", None)
+        current_stop_event = getattr(self, "_stop_event", None)
+        if stop_event is not current_stop_event and hasattr(stop_event, "set"):
+            try:
+                stop_event.set()
+            except Exception as exc:
+                self._log_warn("poll", "legacy poll stop signal failed", error=exc)
+
+        release_lock = getattr(owner, "_release_poll_lock", None)
+        if callable(release_lock):
+            try:
+                release_lock()
+            except Exception as exc:
+                self._log_warn("poll", "legacy poll lock release failed", error=exc)
+
+        release_claim = getattr(owner, "_release_poll_instance_claim", None)
+        if callable(release_claim):
+            try:
+                release_claim()
+            except Exception as exc:
+                self._log_warn("poll", "legacy poll instance release failed", error=exc)
 
     def _get_poll_instance_path(self) -> Path:
         path = getattr(self, "_poll_instance_path", None)
@@ -245,10 +314,13 @@ class SteamUpdatePush(Star):
             owner = frame.f_locals.get("self") if frame and getattr(frame, "f_locals", None) else None
             if owner is None:
                 continue
+            if owner is self:
+                continue
             owner_dir = getattr(owner, "_data_dir", None)
             if owner_dir != self._data_dir:
                 continue
             try:
+                self._stop_legacy_poll_owner(owner)
                 task.cancel()
                 cancelled += 1
             except Exception as exc:
@@ -674,6 +746,8 @@ class SteamUpdatePush(Star):
                 await self._poll_once()
             except Exception:
                 logger.exception("[steam_updates][poll] loop execution failed")
+            finally:
+                self._release_poll_lock()
 
     async def _poll_once(self):
         await self._ensure_http_client()
