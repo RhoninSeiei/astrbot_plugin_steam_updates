@@ -52,6 +52,7 @@ STEAM_IMAGE_DOMAINS = {
 MAX_NEWS_IMAGE_BYTES = 4_000_000
 MAX_NEWS_IMAGE_PIXELS = 3_500_000
 MAX_NEWS_IMAGE_CACHE_FILES = 400
+MAX_CARD_RENDER_PIXELS = 20_000_000
 
 
 @dataclass
@@ -63,6 +64,7 @@ class NewsItem:
     date: int
     appid: str = ""
     image_url: str = ""
+    image_candidates: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1534,6 +1536,7 @@ class SteamUpdatePush(Star):
                 date=int(item.date or 0),
                 appid=str(item.appid or ""),
                 image_url=str(item.image_url or ""),
+                image_candidates=tuple(getattr(item, "image_candidates", ()) or ()),
             )
             old = merged.get(gid)
             if old is None:
@@ -1552,6 +1555,12 @@ class SteamUpdatePush(Star):
                 old.appid = normalized.appid
             if normalized.image_url and not old.image_url:
                 old.image_url = normalized.image_url
+            if normalized.image_candidates:
+                old.image_candidates = tuple(
+                    dict.fromkeys(
+                        (*old.image_candidates, *normalized.image_candidates)
+                    )
+                )
 
         result = list(merged.values())
         result.sort(key=lambda x: (int(x.date or 0), str(x.gid)), reverse=True)
@@ -2570,6 +2579,7 @@ class SteamUpdatePush(Star):
                     date=int(item.get("date", 0)),
                     appid=str(appid),
                     image_url=image_candidates[0] if image_candidates else "",
+                    image_candidates=tuple(image_candidates),
                 )
             )
         self._log_debug(
@@ -2614,23 +2624,28 @@ class SteamUpdatePush(Star):
         except Exception:
             return 0
 
-    def _first_feed_image_url(self, item: ET.Element, description: str) -> str:
+    def _feed_image_candidates(self, item: ET.Element, description: str) -> tuple[str, ...]:
+        candidates: list[str] = []
         markup = html.unescape(description or "")
         for match in re.finditer(
             r"(?is)<img\b[^>]*?\bsrc\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s>]+))",
             markup,
         ):
             source = next((value for value in match.groups() if value), "")
-            candidates = self._extract_news_image_candidates(source)
-            if candidates:
-                return candidates[0]
+            for url in self._extract_news_image_candidates(source):
+                if url not in candidates:
+                    candidates.append(url)
         for child in item.iter():
             if child.tag.rsplit("}", 1)[-1].lower() != "enclosure":
                 continue
-            candidates = self._extract_news_image_candidates(child.attrib.get("url", ""))
-            if candidates:
-                return candidates[0]
-        return ""
+            for url in self._extract_news_image_candidates(child.attrib.get("url", "")):
+                if url not in candidates:
+                    candidates.append(url)
+        return tuple(candidates)
+
+    def _first_feed_image_url(self, item: ET.Element, description: str) -> str:
+        candidates = self._feed_image_candidates(item, description)
+        return candidates[0] if candidates else ""
 
     async def _fetch_news_feed(self, appid: str, count: int) -> list[NewsItem]:
         feed_url = STEAM_NEWS_FEED_API.format(appid=appid)
@@ -2660,7 +2675,7 @@ class SteamUpdatePush(Star):
             desc = (item.findtext("description") or "").strip()
             ts = self._parse_feed_pub_ts(pub_date)
             gid = self._gid_from_feed(link, title, ts)
-            image_url = self._first_feed_image_url(item, desc)
+            image_candidates = self._feed_image_candidates(item, desc)
             results.append(
                 NewsItem(
                     gid=gid,
@@ -2669,7 +2684,8 @@ class SteamUpdatePush(Star):
                     contents=self._feed_text_to_plain(desc),
                     date=ts,
                     appid=str(appid),
-                    image_url=image_url,
+                    image_url=image_candidates[0] if image_candidates else "",
+                    image_candidates=image_candidates,
                 )
             )
         self._log_debug(
@@ -3034,7 +3050,12 @@ class SteamUpdatePush(Star):
                 sections.append(AppSection(appid=appid, title=title, updates=items))
                 continue
             latest_ts = max((it.date for it in items if it.date), default=items[0].date)
-            image_url = next((it.image_url for it in items if it.image_url), "")
+            image_candidates: list[str] = []
+            for item in items:
+                for url in self._item_image_candidates(item):
+                    if url not in image_candidates:
+                        image_candidates.append(url)
+            image_url = image_candidates[0] if image_candidates else ""
             merged = NewsItem(
                 gid=items[0].gid,
                 title=items[0].title or "更新内容",
@@ -3043,6 +3064,7 @@ class SteamUpdatePush(Star):
                 date=latest_ts,
                 appid=items[0].appid,
                 image_url=image_url,
+                image_candidates=tuple(image_candidates),
             )
             sections.append(AppSection(appid=appid, title=title, updates=[merged]))
         return sections
@@ -3270,6 +3292,8 @@ class SteamUpdatePush(Star):
         footer_h = 70
         total_height = header_h + 28 + body_height + footer_h
 
+        if width * total_height > MAX_CARD_RENDER_PIXELS:
+            return None
         img = PilImage.new("RGB", (width, total_height), (23, 26, 33))
         draw = ImageDraw.Draw(img)
         self._draw_gradient(draw, width, total_height)
@@ -3441,12 +3465,14 @@ class SteamUpdatePush(Star):
                     image_urls = [u]
             else:
                 item_image = self._first_prefetched_item_image(item, image_map)
-                if item_image is None:
+                if item_image is not None and self._news_image_fits_card_budget(
+                    item_image, image_max_width
+                ):
+                    item_image = self._scale_news_image(item_image, image_max_width)
+                else:
                     item_image = header_map.get(sec.appid)
                     if item_image:
                         item_image = self._scale_image(item_image, image_max_width, max_img_h)
-                else:
-                    item_image = self._scale_news_image(item_image, image_max_width)
                 if item_image:
                     blocks.append(RenderBlock("image", image=item_image, gap=10, align="center"))
             if is_free_games_sec:
@@ -3652,8 +3678,12 @@ class SteamUpdatePush(Star):
 
     def _item_image_candidates(self, item: NewsItem) -> list[str]:
         candidates: list[str] = []
+        for url in tuple(getattr(item, "image_candidates", ()) or ()):
+            normalized = str(url or "").strip()
+            if normalized and normalized not in candidates:
+                candidates.append(normalized)
         image_url = str(getattr(item, "image_url", "") or "").strip()
-        if image_url:
+        if image_url and image_url not in candidates:
             candidates.append(image_url)
         for url in self._extract_news_image_candidates(item.contents):
             if url not in candidates:
@@ -3794,18 +3824,28 @@ class SteamUpdatePush(Star):
 
         semaphore = asyncio.Semaphore(self._prefetch_image_concurrency())
         results: dict[str, PilImage.Image] = {}
+        download_tasks: dict[str, asyncio.Task[PilImage.Image | None]] = {}
+
+        async def _load_url(url: str) -> PilImage.Image | None:
+            async with semaphore:
+                return await self._download_image(url)
+
+        async def _fetch_url(url: str) -> PilImage.Image | None:
+            task = download_tasks.get(url)
+            if task is None:
+                task = asyncio.create_task(_load_url(url))
+                download_tasks[url] = task
+            return await task
 
         async def _fetch_first(candidates: list[str]):
-            async with semaphore:
-                for url in candidates:
-                    img = await self._download_image(url)
-                    if img:
-                        results[url] = img
-                        return
+            for url in candidates:
+                img = await _fetch_url(url)
+                if img:
+                    results[url] = img
+                    return
 
         async def _fetch_special(url: str):
-            async with semaphore:
-                img = await self._download_image(url)
+            img = await _fetch_url(url)
             if img:
                 results[url] = img
 
@@ -3891,6 +3931,13 @@ class SteamUpdatePush(Star):
         ratio = min(max_w / img.width, max_h / img.height)
         new_size = (max(1, int(img.width * ratio)), max(1, int(img.height * ratio)))
         return img.resize(new_size, PilImage.LANCZOS)
+
+    @staticmethod
+    def _news_image_fits_card_budget(img: PilImage.Image, max_w: int) -> bool:
+        scaled_height = img.height
+        if img.width > max_w:
+            scaled_height = max(1, round(img.height * max_w / img.width))
+        return 900 * scaled_height <= MAX_CARD_RENDER_PIXELS
 
     def _scale_news_image(self, img: PilImage.Image, max_w: int) -> PilImage.Image:
         if img.width <= max_w:
