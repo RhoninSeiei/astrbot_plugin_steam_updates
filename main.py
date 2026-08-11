@@ -83,6 +83,7 @@ class RenderBlock:
     gap: int = 0
     image: PilImage.Image | None = None
     align: str = "left"
+    top_gap: int = 0
 
 
 @dataclass(frozen=True)
@@ -3236,6 +3237,7 @@ class SteamUpdatePush(Star):
                 y += self._font_height(block.font) + block.gap
             elif block.kind == "image":
                 if block.image:
+                    y += block.top_gap
                     image_x = padding
                     if block.align == "center":
                         content_width = width - 2 * padding
@@ -3539,7 +3541,7 @@ class SteamUpdatePush(Star):
             if block.kind == "text":
                 height += self._font_height(block.font) + block.gap
             elif block.kind == "image":
-                height += (block.image.height if block.image else 0) + block.gap
+                height += block.top_gap + (block.image.height if block.image else 0) + block.gap
             else:
                 height += 1 + block.gap
         height += padding
