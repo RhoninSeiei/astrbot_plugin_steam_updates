@@ -33,6 +33,11 @@ class BotRecorder:
         self.calls.append((group_id, message))
 
 
+class ActionFailed(Exception):
+    def __init__(self, message):
+        self.result = {"retcode": 1200, "message": message}
+
+
 class NotifyTargetsTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -122,13 +127,90 @@ class NotifyTargetsTest(unittest.TestCase):
             [session for session, _ in context.calls],
             [target.umo for target in targets],
         )
-        rendered_logs = json.dumps(
-            plugin._warnings,
-            ensure_ascii=False,
-            default=str,
-        )
+        rendered_logs = json.dumps(plugin._warnings, ensure_ascii=False, default=str)
         self.assertNotIn(targets[3].umo, rendered_logs)
         self.assertIn("RuntimeError", rendered_logs)
+
+    def test_receipt_timeout_does_not_retry_via_bot_or_text(self):
+        for error in (
+            ActionFailed("Timeout: NTEvent serviceAndMethod:NodeIKernelMsgService/sendMsg ListenerName:NodeIKernelMsgListener/onMsgInfoListUpdate EventRet:"),
+            asyncio.TimeoutError(),
+        ):
+            with self.subTest(error=type(error).__name__):
+                plugin = self._make_plugin()
+                target = self._target("qq-a:GroupMessage:100", "100")
+                plugin.context = SendContext([error])
+                plugin._last_platform_id = "qq-a"
+                plugin._last_bot = BotRecorder()
+                plugin._save_temp_image = lambda data: "/tmp/test.png"
+                async def render(*args, **kwargs):
+                    return b"image"
+                plugin._render_card = render
+                result = asyncio.run(plugin._deliver_poll_payload(
+                    [target], [], "published", "queried", "game", "card"
+                ))
+                self.assertEqual(len(plugin.context.calls), 1)
+                self.assertEqual(plugin._last_bot.calls, [])
+                self.assertEqual(result.succeeded, [])
+                self.assertEqual(result.failed, [])
+                self.assertEqual(result.uncertain, [target])
+
+    def test_explicit_failure_still_falls_back_to_text(self):
+        plugin = self._make_plugin()
+        target = self._target("qq-a:GroupMessage:100")
+        plugin.context = SendContext([ActionFailed("image upload timeout"), True])
+        plugin._save_temp_image = lambda data: "/tmp/test.png"
+        async def render(*args, **kwargs):
+            return b"image"
+        plugin._render_card = render
+        plugin._build_text_message = lambda *args: "text"
+        result = asyncio.run(plugin._deliver_poll_payload(
+            [target], [], "published", "queried", "game", "card"
+        ))
+        self.assertEqual(len(plugin.context.calls), 2)
+        self.assertEqual(result.succeeded, [target])
+        self.assertEqual(result.failed, [])
+
+    def test_poll_uncertain_delivery_advances_deduplication_state(self):
+        plugin = self._make_poll_plugin()
+        target = self._target("qq-a:GroupMessage:100")
+        plugin._resolve_notify_targets = lambda: [target]
+        async def uncertain(targets, payload):
+            return self.mod.PushResult([], [], list(targets))
+        plugin._push_image = uncertain
+        asyncio.run(plugin._poll_once())
+        self.assertTrue(hasattr(plugin, "_saved_state"))
+
+    def test_mixed_targets_preserve_uncertain_and_retry_only_failure(self):
+        plugin = self._make_plugin()
+        targets = [self._target(f"qq-a:GroupMessage:{i}") for i in range(3)]
+        plugin.context = SendContext([True, asyncio.TimeoutError(), False, True])
+        plugin._save_temp_image = lambda data: "/tmp/test.png"
+        async def render(*args, **kwargs):
+            return b"image"
+        plugin._render_card = render
+        plugin._build_text_message = lambda *args: "text"
+        result = asyncio.run(plugin._deliver_poll_payload(
+            targets, [], "published", "queried", "game", "card"
+        ))
+        self.assertEqual([c[0] for c in plugin.context.calls],
+                         [t.umo for t in targets] + [targets[2].umo])
+        self.assertEqual(result.succeeded, [targets[0], targets[2]])
+        self.assertEqual(result.uncertain, [targets[1]])
+        self.assertEqual(result.failed, [])
+
+    def test_legacy_bot_receipt_timeout_is_uncertain(self):
+        plugin = self._make_plugin()
+        target = self._target("qq-a:GroupMessage:100", "100")
+        plugin.context = SendContext([False])
+        plugin._last_platform_id = "qq-a"
+        class TimeoutBot:
+            async def send_group_msg(self, **kwargs):
+                raise asyncio.TimeoutError()
+        plugin._last_bot = TimeoutBot()
+        result = asyncio.run(plugin._push_chain([target], self._chain()))
+        self.assertEqual(result.uncertain, [target])
+        self.assertEqual(result.failed, [])
 
     def test_bot_fallback_accepts_matching_numeric_legacy_group(self):
         target = self._target(

@@ -14,7 +14,7 @@ import uuid
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -100,6 +100,7 @@ class NotifyTarget:
 class PushResult:
     succeeded: list[NotifyTarget]
     failed: list[NotifyTarget]
+    uncertain: list[NotifyTarget] = field(default_factory=list)
 
 
 class SteamUpdatePush(Star):
@@ -1104,7 +1105,9 @@ class SteamUpdatePush(Star):
             targets=len(targets),
         )
 
-        if not any(result.succeeded for result in push_results):
+        # A lost send receipt may still mean delivery. Advance deduplication
+        # for uncertain sends too, rather than resending on the next poll.
+        if not any(result.succeeded or result.uncertain for result in push_results):
             self._log_warn(
                 "poll",
                 "all notification sends failed; state preserved",
@@ -1181,6 +1184,7 @@ class SteamUpdatePush(Star):
         succeeded_targets = set(image_result.succeeded)
         succeeded_targets.update(text_result.succeeded)
         failed_targets = set(text_result.failed)
+        uncertain_targets = set(image_result.uncertain) | set(text_result.uncertain)
         return PushResult(
             succeeded=[
                 target for target in targets
@@ -1190,6 +1194,7 @@ class SteamUpdatePush(Star):
                 target for target in targets
                 if target in failed_targets
             ],
+            uncertain=[target for target in targets if target in uncertain_targets],
         )
 
     async def _manual_query(self, umo: str | None = None, query_kind: str = "all"):
@@ -4169,6 +4174,7 @@ class SteamUpdatePush(Star):
         )
         succeeded: list[NotifyTarget] = []
         failed: list[NotifyTarget] = []
+        uncertain: list[NotifyTarget] = []
         for index, target in enumerate(targets, start=1):
             sent = await self._send_to_target(
                 target,
@@ -4180,20 +4186,39 @@ class SteamUpdatePush(Star):
                 index,
                 legacy=bool(target.legacy_group_id),
             )
-            if sent:
+            if sent is None:
+                uncertain.append(target)
+                self._log_warn("push", "delivery uncertain; automatic retry suppressed", **fields)
+            elif sent:
                 succeeded.append(target)
                 self._log_debug("push", "target sent", **fields)
             else:
                 failed.append(target)
                 self._log_warn("push", "target failed", **fields)
-        return PushResult(succeeded, failed)
+        return PushResult(succeeded, failed, uncertain)
+
+    @staticmethod
+    def _send_receipt_uncertain(exc: Exception) -> bool:
+        if isinstance(exc, TimeoutError):
+            return True
+        # NapCat may deliver the message before its NT send receipt times out.
+        # Do not classify upload/download timeouts or all ActionFailed errors
+        # as uncertain: those still need the ordinary fallback.
+        result = getattr(exc, "result", None)
+        if not isinstance(result, dict):
+            return False
+        detail = " ".join(
+            value for key in ("message", "wording")
+            if isinstance((value := result.get(key)), str)
+        ).lower()
+        return "timeout" in detail and "nodeikernelmsgservice/sendmsg" in detail
 
     async def _send_to_target(
         self,
         target: NotifyTarget,
         chain: MessageChain,
         target_index: int,
-    ) -> bool:
+    ) -> bool | None:
         fields = self._target_log_fields(
             target.umo,
             target_index,
@@ -4213,6 +4238,8 @@ class SteamUpdatePush(Star):
                 **fields,
             )
         except Exception as exc:
+            if self._send_receipt_uncertain(exc):
+                return None
             self._log_warn(
                 "send",
                 "session failed",
@@ -4249,6 +4276,8 @@ class SteamUpdatePush(Star):
             self._log_debug("send", "via bot", **fields)
             return True
         except Exception as exc:
+            if self._send_receipt_uncertain(exc):
+                return None
             self._log_warn(
                 "send",
                 "bot fallback failed",
