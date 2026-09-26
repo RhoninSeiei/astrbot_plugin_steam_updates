@@ -151,6 +151,8 @@ class SteamUpdatePush(Star):
     async def initialize(self):
         await self._ensure_http_client()
         self._cancel_legacy_poll_tasks()
+        await self._finish_legacy_poll_tasks()
+        self._recover_orphan_poll_locks()
         self._claim_poll_instance()
         self._poll_task = asyncio.create_task(self._poll_loop())
 
@@ -158,6 +160,7 @@ class SteamUpdatePush(Star):
         self._stop_event.set()
         if self._poll_task:
             self._poll_task.cancel()
+            await asyncio.gather(self._poll_task, return_exceptions=True)
         self._release_poll_lock()
         self._release_poll_instance_claim()
         if self._client:
@@ -255,6 +258,7 @@ class SteamUpdatePush(Star):
 
     def _cancel_legacy_poll_tasks(self) -> int:
         cancelled = 0
+        self._retired_poll_tasks = []
         for task in asyncio.all_tasks():
             try:
                 coro = task.get_coro()
@@ -270,14 +274,66 @@ class SteamUpdatePush(Star):
             owner_dir = getattr(owner, "_data_dir", None)
             if owner_dir != self._data_dir:
                 continue
+            if owner is self:
+                continue
             try:
                 task.cancel()
+                self._retired_poll_tasks.append((task, owner))
                 cancelled += 1
             except Exception as exc:
                 self._log_warn("poll", "legacy poll task cancel failed", error=exc)
         if cancelled:
             self._log_warn("poll", "cancelled legacy poll tasks", count=cancelled)
         return cancelled
+
+    async def _finish_legacy_poll_tasks(self) -> None:
+        retired = self._retired_poll_tasks
+        if not retired:
+            return
+        done, pending = await asyncio.wait([task for task, _ in retired], timeout=5)
+        if pending:
+            raise RuntimeError("old Steam poll task did not stop; refusing lock recovery")
+        await asyncio.gather(*done, return_exceptions=True)
+        for _, owner in retired:
+            # Old releases lack a cancellation finally block. Clean their
+            # resources only after their coroutine has actually stopped.
+            await owner.terminate()
+        self._retired_poll_tasks = []
+
+    def _recover_orphan_poll_locks(self) -> None:
+        """Recover locks leaked by already-cancelled pre-fix tasks on Linux.
+
+        Only this process's descriptors for this exact inode are unlocked.
+        Do not close foreign descriptors: an old object may still own them.
+        Never unlink the lock file or interfere with another process's lock.
+        Called only after all matching legacy tasks have stopped.
+        """
+        if fcntl is None or not Path("/proc/self/fdinfo").is_dir():
+            return
+        try:
+            expected = self._poll_lock_path.stat()
+        except FileNotFoundError:
+            return
+        recovered = 0
+        for entry in Path("/proc/self/fdinfo").iterdir():
+            if not entry.name.isdigit():
+                continue
+            fd = int(entry.name)
+            if fd == self._poll_lock_fd:
+                continue
+            try:
+                actual = os.fstat(fd)
+                if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+                    continue
+                if not any(line.startswith("lock:") and " FLOCK " in line
+                           for line in entry.read_text().splitlines()):
+                    continue
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                recovered += 1
+            except (FileNotFoundError, OSError):
+                continue
+        if recovered:
+            self._log_warn("poll", "recovered orphaned same-process locks", count=recovered)
 
     # --- config helpers ---
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -841,6 +897,13 @@ class SteamUpdatePush(Star):
 
     # --- polling ---
     async def _poll_loop(self):
+        try:
+            await self._run_poll_loop()
+        finally:
+            self._release_poll_lock()
+            self._release_poll_instance_claim()
+
+    async def _run_poll_loop(self):
         while not self._stop_event.is_set():
             if not self._is_current_poll_instance():
                 self._release_poll_lock()
@@ -861,10 +924,11 @@ class SteamUpdatePush(Star):
                 self._log_warn("poll", "stale poll instance detected before execution")
                 break
             if not self._try_acquire_poll_lock():
-                self._log_debug("poll", "skip: lock held by another instance")
+                self._log_warn("poll", "skip: lock held by another instance")
                 continue
             try:
                 await self._poll_once()
+                logger.info("[steam_updates][poll] cycle completed")
             except Exception:
                 logger.exception("[steam_updates][poll] loop execution failed")
 
