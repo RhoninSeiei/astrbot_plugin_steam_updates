@@ -84,6 +84,18 @@
         "default": true,
         "hint": "当 Steam News API 失败或无数据时，自动回退到 Steam 商店 Feed"
       },
+      "game_query_concurrency": {
+        "description": "游戏新闻最大并发查询数",
+        "type": "int",
+        "default": 4,
+        "hint": "轮询和手动查询共享并发上限，范围 1-8"
+      },
+      "appdetails_retry_attempts": {
+        "description": "AppID 名称查询最大尝试次数",
+        "type": "int",
+        "default": 3,
+        "hint": "范围 1-5，每次重试间隔 2 秒；失败缓存 10 分钟"
+      },
       "feed_timeout_sec": {
         "description": "Feed 回退请求超时(秒)",
         "type": "int",

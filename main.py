@@ -130,13 +130,17 @@ class SteamUpdatePush(Star):
 
         self._client: httpx.AsyncClient | None = None
         self._client_signature: str = ""
+        self._news_query_semaphore: asyncio.Semaphore | None = None
+        self._news_query_semaphore_limit: int | None = None
         self._poll_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
         self._last_platform_id: str | None = None
         self._last_bot: Any | None = None
         self._appid_name_map: dict[str, Any] | None = None
-        self._name_cache: dict[str, str] | None = None
+        self._name_cache: dict[str, Any] | None = None
         self._name_cache_path = self._data_dir / "app_name_cache.json"
+        self._app_name_inflight: dict[str, asyncio.Task[str]] = {}
+        self._name_cache_lock: asyncio.Lock | None = None
         self._trace_seq = 0
         self._image_fail_until: dict[str, float] = {}
         self._header_fail_until: dict[str, float] = {}
@@ -146,6 +150,7 @@ class SteamUpdatePush(Star):
         self._poll_lock_owner = False
         self._poll_instance_path = self._data_dir / ".poll.instance"
         self._poll_instance_token = ""
+
 
     # --- lifecycle ---
     async def initialize(self):
@@ -163,6 +168,13 @@ class SteamUpdatePush(Star):
             await asyncio.gather(self._poll_task, return_exceptions=True)
         self._release_poll_lock()
         self._release_poll_instance_claim()
+        inflight = getattr(self, "_app_name_inflight", {})
+        tasks = list(inflight.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        inflight.clear()
         if self._client:
             await self._client.aclose()
         self._client = None
@@ -547,16 +559,21 @@ class SteamUpdatePush(Star):
 
     def _build_http_client(self) -> httpx.AsyncClient:
         timeout = httpx.Timeout(10.0)
+        query_concurrency = self._game_query_concurrency()
+        limits = httpx.Limits(
+            max_connections=max(16, query_concurrency * 2),
+            max_keepalive_connections=max(8, query_concurrency),
+        )
         mode = self._proxy_mode()
 
         if mode == "off":
             self._log_debug("network", "client init", proxy_mode=mode, trust_env=False)
-            return httpx.AsyncClient(timeout=timeout, trust_env=False)
+            return httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
 
         if mode == "system":
             # Use OS/container proxy env such as HTTP_PROXY / HTTPS_PROXY.
             self._log_debug("network", "client init", proxy_mode=mode, trust_env=True)
-            return httpx.AsyncClient(timeout=timeout, trust_env=True)
+            return httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=True)
 
         proxy_url = self._proxy_url()
         if not proxy_url:
@@ -569,7 +586,12 @@ class SteamUpdatePush(Star):
         masked = self._mask_proxy_url(proxy_url)
         try:
             self._log_debug("network", "client init", proxy_mode=mode, proxy=masked)
-            return httpx.AsyncClient(timeout=timeout, proxy=proxy_url, trust_env=False)
+            return httpx.AsyncClient(
+                timeout=timeout,
+                limits=limits,
+                proxy=proxy_url,
+                trust_env=False,
+            )
         except Exception as exc:
             self._log_warn(
                 "network",
@@ -577,7 +599,8 @@ class SteamUpdatePush(Star):
                 proxy=masked,
                 error=exc,
             )
-            return httpx.AsyncClient(timeout=timeout, trust_env=False)
+            return httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
+
 
     def _http_client_signature(self) -> str:
         return f"{self._proxy_mode()}|{self._proxy_url()}"
@@ -640,8 +663,17 @@ class SteamUpdatePush(Star):
                 fallback=fallback_kind,
                 error=self._exc_text(exc),
             )
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), **fallback_kwargs) as client:
+            fallback_limits = httpx.Limits(
+                max_connections=max(16, self._game_query_concurrency() * 2),
+                max_keepalive_connections=max(8, self._game_query_concurrency()),
+            )
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0),
+                limits=fallback_limits,
+                **fallback_kwargs,
+            ) as client:
                 return await client.request(method, url, **kwargs)
+
 
     def _next_trace_id(self, prefix: str) -> str:
         self._trace_seq = (self._trace_seq + 1) % 1_000_000
@@ -982,8 +1014,14 @@ class SteamUpdatePush(Star):
         )
         updates_by_app: dict[str, list[NewsItem]] = {}
         app_state_updates: dict[str, str] = {}
+        fetched_updates = await self._fetch_news_for_appids(
+            appids,
+            fetch_count,
+            only_today=True,
+            trace=trace,
+        )
         for appid in appids:
-            items = await self._fetch_news(appid, fetch_count)
+            items = fetched_updates.get(appid, [])
             if not items:
                 self._log_debug("poll", "appid has no updates", trace=trace, appid=appid)
                 continue
@@ -1169,8 +1207,6 @@ class SteamUpdatePush(Star):
             targets=len(targets),
         )
 
-        # A lost send receipt may still mean delivery. Advance deduplication
-        # for uncertain sends too, rather than resending on the next poll.
         if not any(result.succeeded or result.uncertain for result in push_results):
             self._log_warn(
                 "poll",
@@ -1194,6 +1230,7 @@ class SteamUpdatePush(Star):
             return
         self._save_state(state)
         self._log_debug("poll", "state updated", trace=trace, state_size=len(state))
+
 
     async def _deliver_poll_payload(
         self,
@@ -1306,8 +1343,14 @@ class SteamUpdatePush(Star):
 
         updates_by_app: dict[str, list[NewsItem]] = {}
         if want_game:
+            fetched_updates = await self._fetch_news_for_appids(
+                appids,
+                fetch_count,
+                only_today=True,
+                trace=trace,
+            )
             for appid in appids:
-                items = await self._fetch_news(appid, fetch_count, only_today=True)
+                items = fetched_updates.get(appid, [])
                 if not items:
                     self._log_debug("manual", "today has no updates", trace=trace, appid=appid)
                     continue
@@ -1361,12 +1404,21 @@ class SteamUpdatePush(Star):
             else:
                 notice = "\u6ca1\u6709\u627e\u5230\u5f53\u5929\u7684\u66f4\u65b0\u4fe1\u606f\uff0c\u4ee5\u4e0b\u662f\u6700\u8fd1\u4e00\u6b21\u7684\u66f4\u65b0\u5185\u5bb9"
             if want_game:
+                fetched_updates = await self._fetch_news_for_appids(
+                    appids,
+                    fetch_count,
+                    only_today=False,
+                    trace=trace,
+                )
                 for appid in appids:
-                    items = await self._fetch_news(appid, fetch_count, only_today=False)
+                    items = self._filter_recent_days(
+                        fetched_updates.get(appid, []),
+                        max_days,
+                    )
                     if not items:
                         self._log_debug("manual", "fallback has no updates", trace=trace, appid=appid)
                         continue
-                    updates_by_app[appid] = self._filter_recent_days(items, max_days)
+                    updates_by_app[appid] = items
             if workshop_all:
                 # Workshop fallback keeps latest item of each subscribed ID.
                 workshop_updates = workshop_all
@@ -1445,6 +1497,7 @@ class SteamUpdatePush(Star):
 
         self._log_debug("manual", "done", trace=trace, mode=mode, payload_count=len(results))
         return results, None
+
 
 
     def _normalize_manual_commands(self, raw: Any, default_commands: list[str]) -> list[str]:
@@ -2730,12 +2783,249 @@ class SteamUpdatePush(Star):
 
     def _normalize_appids(self, raw_list: Any) -> list[str]:
         appids: list[str] = []
+        seen: set[str] = set()
         for item in raw_list or []:
             val = str(item).strip()
-            if not val:
+            if not val or val in seen:
                 continue
+            seen.add(val)
             appids.append(val)
         return appids
+
+
+    def _game_query_concurrency(self) -> int:
+        try:
+            value = int(self._cfg("game_query_concurrency", 4))
+        except Exception:
+            value = 4
+        return max(1, min(value, 8))
+
+
+    def _get_news_query_semaphore(self) -> asyncio.Semaphore:
+        limit = self._game_query_concurrency()
+        semaphore = getattr(self, "_news_query_semaphore", None)
+        semaphore_limit = getattr(self, "_news_query_semaphore_limit", None)
+        if (
+            semaphore is None
+            or semaphore_limit != limit
+        ):
+            semaphore = asyncio.Semaphore(limit)
+            self._news_query_semaphore = semaphore
+            self._news_query_semaphore_limit = limit
+        return semaphore
+
+
+    async def _fetch_news_for_appids(
+        self,
+        appids: list[str],
+        count: int,
+        *,
+        only_today: bool,
+        trace: str = "",
+    ) -> dict[str, list[NewsItem]]:
+        if not appids:
+            return {}
+
+        semaphore = self._get_news_query_semaphore()
+
+        async def fetch_one(appid: str) -> tuple[str, list[NewsItem]]:
+            started = time.perf_counter()
+            async with semaphore:
+                items = await self._fetch_news(
+                    appid,
+                    count,
+                    only_today=only_today,
+                )
+            self._log_debug(
+                "fetch",
+                "appid query finished",
+                trace=trace,
+                appid=appid,
+                item_count=len(items),
+                ms=int((time.perf_counter() - started) * 1000),
+                only_today=only_today,
+            )
+            return appid, items
+
+        results = await asyncio.gather(
+            *(fetch_one(appid) for appid in appids),
+            return_exceptions=True,
+        )
+        updates_by_app: dict[str, list[NewsItem]] = {}
+        error_count = 0
+        for appid, result in zip(appids, results):
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                error_count += 1
+                self._log_warn(
+                    "fetch",
+                    "appid query failed",
+                    trace=trace,
+                    appid=appid,
+                    error_type=type(result).__name__,
+                )
+                continue
+            result_appid, items = result
+            updates_by_app[result_appid] = items
+        self._log_debug(
+            "fetch",
+            "appid query batch finished",
+            trace=trace,
+            app_count=len(appids),
+            concurrency=self._game_query_concurrency(),
+            result_count=len(updates_by_app),
+            error_count=error_count,
+            only_today=only_today,
+        )
+        return updates_by_app
+
+
+    def _get_name_cache_lock(self) -> asyncio.Lock:
+        lock = getattr(self, "_name_cache_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._name_cache_lock = lock
+        return lock
+
+
+    @staticmethod
+    def _app_name_fallback(appid: str) -> str:
+        return f"AppID {appid}"
+
+
+    @staticmethod
+    def _name_cache_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return str(value.get("value") or "").strip()
+        return ""
+
+
+    def _get_negative_name_cache_value(self, value: Any) -> str | None:
+        if not isinstance(value, dict) or value.get("status") != "retry_exhausted":
+            return None
+        try:
+            retry_after = float(value.get("retry_after", 0))
+        except (TypeError, ValueError):
+            return None
+        if retry_after > time.time():
+            return self._name_cache_value(value) or None
+        return None
+
+
+    def _appdetails_retry_attempts(self) -> int:
+        try:
+            value = int(self._cfg("appdetails_retry_attempts", 3))
+        except Exception:
+            value = 3
+        return max(1, min(value, 5))
+
+
+    @staticmethod
+    def _is_retryable_appdetails_status(status_code: int) -> bool:
+        return status_code == 429 or status_code >= 500
+
+
+    @classmethod
+    def _is_retryable_appdetails_exception(cls, exc: Exception) -> bool:
+        if isinstance(exc, (httpx.RequestError, httpx.TimeoutException, ValueError)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            response = exc.response
+            return bool(response and cls._is_retryable_appdetails_status(response.status_code))
+        return False
+
+
+    async def _save_name_cache_value(self, cache_key: str, value: Any) -> None:
+        cache = self._load_name_cache()
+        async with self._get_name_cache_lock():
+            cache[cache_key] = value
+            self._save_name_cache()
+
+
+    async def _query_app_name_by_lang(self, appid: str, lang: str) -> str:
+        appid_map = self._load_appid_name_map()
+        cache_key = f"{appid}:{lang}"
+        attempts = self._appdetails_retry_attempts()
+        fallback = self._app_name_fallback(appid)
+
+        if not getattr(self, "_client", None):
+            return fallback
+
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = await self._request_with_network_fallback(
+                    "GET",
+                    "https://store.steampowered.com/api/appdetails",
+                    params={"appids": appid, "l": lang},
+                    timeout=10,
+                )
+                if self._is_retryable_appdetails_status(resp.status_code):
+                    resp.raise_for_status()
+                if 400 <= resp.status_code < 500:
+                    resp.raise_for_status()
+                    return fallback
+                resp.raise_for_status()
+                data = resp.json()
+                entry = data.get(str(appid)) or data.get(int(appid)) or {}
+                if not isinstance(entry, dict):
+                    raise ValueError("invalid appdetails entry")
+                if entry.get("success") is False:
+                    return fallback
+                if not entry.get("success") or not isinstance(entry.get("data"), dict):
+                    raise ValueError("incomplete appdetails response")
+                name = str(entry["data"].get("name", "")).strip()
+                if not name:
+                    return fallback
+
+                await self._save_name_cache_value(cache_key, name)
+                async with self._get_name_cache_lock():
+                    current = appid_map.get(str(appid))
+                    if isinstance(current, dict):
+                        current[str(lang)] = name
+                    elif current:
+                        current = {"default": str(current), str(lang): name}
+                    else:
+                        current = {str(lang): name}
+                    appid_map[str(appid)] = current
+                    self._save_appid_name_map()
+                return name
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._is_retryable_appdetails_exception(exc):
+                    self._log_debug(
+                        "appdetails",
+                        "non-retryable name query failure",
+                        appid=appid,
+                        error_type=type(exc).__name__,
+                    )
+                    return fallback
+                self._log_debug(
+                    "appdetails",
+                    "name query attempt failed",
+                    appid=appid,
+                    attempt=attempt,
+                    attempts=attempts,
+                    error_type=type(exc).__name__,
+                )
+                if attempt < attempts:
+                    await asyncio.sleep(2)
+
+        now = int(time.time())
+        await self._save_name_cache_value(
+            cache_key,
+            {
+                "value": fallback,
+                "status": "retry_exhausted",
+                "failed_at": now,
+                "retry_after": now + 600,
+            },
+        )
+        return fallback
+
 
     def _appid_map_path(self) -> Path:
         return Path(__file__).with_name("appid_map.json")
@@ -2766,19 +3056,20 @@ class SteamUpdatePush(Star):
         except Exception as exc:
             self._debug(f"save appid map failed: {exc}")
 
-    def _load_name_cache(self) -> dict[str, str]:
+    def _load_name_cache(self) -> dict[str, Any]:
         if self._name_cache is not None:
             return self._name_cache
         if self._name_cache_path.exists():
             try:
                 data = json.loads(self._name_cache_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    self._name_cache = {str(k): str(v) for k, v in data.items()}
+                    self._name_cache = {str(k): v for k, v in data.items()}
                     return self._name_cache
             except Exception as exc:
                 self._debug(f"load name cache failed: {exc}")
         self._name_cache = {}
         return self._name_cache
+
 
     def _save_name_cache(self) -> None:
         if self._name_cache is None:
@@ -2807,6 +3098,10 @@ class SteamUpdatePush(Star):
 
     async def _get_app_name_by_lang(self, appid: str, lang: str) -> str:
         lang = str(lang or "schinese").strip().lower() or "schinese"
+        appid = str(appid or "").strip()
+        fallback = self._app_name_fallback(appid)
+        if not appid.isdigit():
+            return fallback
         appid_map = self._load_appid_name_map()
         mapped = self._pick_name_from_map(appid_map.get(str(appid)), lang)
         if mapped:
@@ -2815,43 +3110,31 @@ class SteamUpdatePush(Star):
         cache = self._load_name_cache()
         cache_key = f"{appid}:{lang}"
         if cache_key in cache:
-            return cache[cache_key]
+            cached_name = self._name_cache_value(cache[cache_key])
+            if isinstance(cache[cache_key], str) and cached_name:
+                return cached_name
+            negative_name = self._get_negative_name_cache_value(cache[cache_key])
+            if negative_name:
+                return negative_name
 
-        if not self._client:
-            return f"AppID {appid}"
+        inflight = getattr(self, "_app_name_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._app_name_inflight = inflight
+        existing = inflight.get(cache_key)
+        if existing is not None and not existing.done():
+            return await asyncio.shield(existing)
 
-        try:
-            resp = await self._request_with_network_fallback(
-                "GET",
-                "https://store.steampowered.com/api/appdetails",
-                params={"appids": appid, "l": lang},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            entry = data.get(str(appid)) or data.get(int(appid)) or {}
-            if entry.get("success") and isinstance(entry.get("data"), dict):
-                name = str(entry["data"].get("name", "")).strip()
-                if name:
-                    cache[cache_key] = name
-                    self._save_name_cache()
-                    try:
-                        current = appid_map.get(str(appid))
-                        if isinstance(current, dict):
-                            current[str(lang)] = name
-                        elif current:
-                            current = {"default": str(current), str(lang): name}
-                        else:
-                            current = {str(lang): name}
-                        appid_map[str(appid)] = current
-                        self._save_appid_name_map()
-                    except Exception as exc:
-                        self._debug(f"update appid map failed: {exc}")
-                    return name
-        except Exception as exc:
-            self._debug(f"fetch app name failed ({appid}): {exc}")
+        task = asyncio.create_task(self._query_app_name_by_lang(appid, lang))
+        inflight[cache_key] = task
+        def finished(done: asyncio.Task[str]) -> None:
+            if inflight.get(cache_key) is done:
+                inflight.pop(cache_key, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(finished)
+        return await asyncio.shield(task)
 
-        return f"AppID {appid}"
 
     async def _get_app_name(self, appid: str) -> str:
         lang = str(self._cfg("steam_lang", "schinese")).strip().lower() or "schinese"

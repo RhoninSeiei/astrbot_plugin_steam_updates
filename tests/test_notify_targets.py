@@ -782,7 +782,9 @@ class NotifyContractTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("## v1.2.10", changelog)
-        self.assertIn("version: v1.2.10", metadata)
+        version = next(line.split(":", 1)[1].strip()
+                       for line in metadata.splitlines() if line.startswith("version:"))
+        self.assertIn("## " + version, changelog)
 
 
 if __name__ == "__main__":

@@ -75,6 +75,8 @@ AstrBot WebUI -> 插件 -> 插件配置
 | steam_web_api_key | Steam Web API Key（可选） |
 | enable_feed_fallback | 是否启用 Steam Feed 回退 |
 | feed_timeout_sec | Feed 回退超时秒数 |
+| game_query_concurrency | 游戏新闻并发上限，轮询和手动查询共享，默认 4，范围 1–8 |
+| appdetails_retry_attempts | 游戏名称查询最大尝试次数，默认 3，范围 1–5，间隔 2 秒 |
 | free_games_enable | 是否启用限时免费领取活动 |
 | free_games_manual_only_when_no_news | 手动查询在没有普通游戏更新时，是否仅返回“限时免费领取”分区 |
 | display_timezone | 免费领取截止时间显示时区；留空跟随容器系统时区，填写 IANA 时区名时按 UTC 活动源时间转换显示 |
@@ -187,6 +189,8 @@ mixin:
 ## 📌 使用方法 | Usage
 
 ### 📣 自动推送
+
+当前维护版为 `v1.3.4-local.1`，整合上游 v1.3.4 查询改进，保留本地字体和生产可靠性修复。游戏名称查询失败会缓存 10 分钟；旧字符串名称缓存可继续读取。若回滚至不支持失败缓存对象的旧版，应同时恢复发布前的 `app_name_cache.json` 备份。人工 AppID 名称映射继续优先。
 
 图片明确发送失败时，仅向失败目标补发文字。发送接口超时或 NapCat 的 `sendMsg` 回执超时时，消息可能已经送达，插件会记录“送达不确定”，不再自动补发，并推进公告去重状态以避免下一轮重复推送。这种情况下，如果消息实际未送达，将不会自动重试。
 开启 enable_push 后，插件会自动轮询并向 notify_umos 与旧 notify_group_ids 的合并目标发送更新。新字段先处理，旧字段随后处理；规范 UMO 相同的目标只发送一次。
