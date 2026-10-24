@@ -176,7 +176,7 @@ class NotifyTargetsTest(unittest.TestCase):
         plugin = self._make_poll_plugin()
         target = self._target("qq-a:GroupMessage:100")
         plugin._resolve_notify_targets = lambda: [target]
-        async def uncertain(targets, payload):
+        async def uncertain(targets, payload, **kwargs):
             return self.mod.PushResult([], [], list(targets))
         plugin._push_image = uncertain
         asyncio.run(plugin._poll_once())
@@ -648,10 +648,10 @@ class NotifyTargetsTest(unittest.TestCase):
         plugin._resolve_notify_targets = lambda: [first, second]
         text_calls = []
 
-        async def push_image(targets, image_bytes):
+        async def push_image(targets, image_bytes, **kwargs):
             return self.mod.PushResult([first], [second])
 
-        async def push_text(targets, text):
+        async def push_text(targets, text, **kwargs):
             text_calls.append(list(targets))
             return self.mod.PushResult(list(targets), [])
 
@@ -668,7 +668,7 @@ class NotifyTargetsTest(unittest.TestCase):
         target = self._target("qq-a:GroupMessage:100")
         plugin._resolve_notify_targets = lambda: [target]
 
-        async def fail(targets, payload):
+        async def fail(targets, payload, **kwargs):
             return self.mod.PushResult([], list(targets))
 
         plugin._push_image = fail
@@ -693,7 +693,7 @@ class NotifyTargetsTest(unittest.TestCase):
             else previous_cfg(key, default)
         )
 
-        async def partial(targets, text):
+        async def partial(targets, text, **kwargs):
             return self.mod.PushResult([first], [second])
 
         plugin._push_text = partial
