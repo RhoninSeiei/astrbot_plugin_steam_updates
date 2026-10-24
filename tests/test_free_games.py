@@ -187,15 +187,8 @@ def _install_stub_modules() -> None:
 
 
 def _load_module():
-    _install_stub_modules()
-    if MODULE_NAME in sys.modules:
-        return sys.modules[MODULE_NAME]
-    spec = importlib.util.spec_from_file_location(MODULE_NAME, PLUGIN_PATH)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules[MODULE_NAME] = module
-    spec.loader.exec_module(module)
-    return module
+    from support import _load_module as load_current
+    return load_current()
 
 
 class FreeGamesLogicTest(unittest.TestCase):
@@ -204,7 +197,9 @@ class FreeGamesLogicTest(unittest.TestCase):
         cls.mod = _load_module()
 
     def _make_plugin(self):
-        plugin = object.__new__(self.mod.SteamUpdatePush)
+        root = Path(tempfile.mkdtemp())
+        with patch.object(self.mod.StarTools, "get_data_dir", return_value=root):
+            plugin = self.mod.SteamUpdatePush(None, {})
         plugin._last_platform_id = None
         plugin._last_bot = None
         plugin._trace_seq = 0
@@ -241,9 +236,11 @@ class FreeGamesLogicTest(unittest.TestCase):
             "message_mode": "card",
             "free_games_enable": True,
             "workshop_enable": bool(workshop_updates),
+            "workshop_push_on_first_seen": True,
             "workshop_item_ids": ["ws1"] if workshop_updates else [],
         }
         plugin._cfg = lambda key, default=None: config.get(key, default)
+        plugin.config = config
         plugin._ensure_http_client = self._async_noop
         plugin._normalize_appids = lambda values: ["730"]
         plugin._normalize_workshop_item_ids = lambda values: ["ws1"] if workshop_updates else []
@@ -262,6 +259,7 @@ class FreeGamesLogicTest(unittest.TestCase):
         plugin._collect_workshop_updates_for_poll = self._async_return(
             (workshop_updates or [], {})
         )
+        plugin._fetch_workshop_news_items = self._async_return(workshop_updates or [])
         plugin._fetch_free_game_items = self._async_return(free_items)
         plugin._build_sections = (
             self._async_return(

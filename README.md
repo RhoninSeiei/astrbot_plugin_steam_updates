@@ -1,6 +1,6 @@
-# Steam Update Push (AstrBot Plugin)
+# ✨ Steam Update Push (AstrBot Plugin)
 
-### Steam 游戏/创意工坊更新推送（Steam News API）
+### ✨ Steam 游戏/创意工坊更新推送
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![AstrBot](https://img.shields.io/badge/AstrBot-v4.12%2B-brightgreen)
 ![License](https://img.shields.io/badge/License-GPL--3.0-orange)
@@ -11,12 +11,26 @@
 
 ## ✅ 简介 | Introduction
 
+<table>
+  <tr>
+    <td width="190" align="center">
+      <img width="170" alt="Steam Update Push logo" src="logo.png" style="border-radius: 24px;" />
+    </td>
+    <td>
+      <strong>Steam Update Push</strong><br />
+      Steam News · Workshop · Free Games<br />
+      <sub>Clear updates, delivered to your AstrBot conversations.</sub>
+    </td>
+  </tr>
+</table>
+
 这是一个为 **AstrBot** 编写的插件：轮询游戏/创意工坊更新并推送（支持多 AppID、创意工坊ID、卡片或文本）
 
 [![Release](https://img.shields.io/github/v/release/DearCrazyLeaf/astrbot_plugin_steam_updates?include_prereleases&color=blueviolet&label=最新版本)](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/releases/latest)
 [![License](https://img.shields.io/badge/许可证-GPL%203.0-orange)](https://www.gnu.org/licenses/gpl-3.0.txt)
 [![Issues](https://img.shields.io/github/issues/DearCrazyLeaf/astrbot_plugin_steam_updates?color=darkgreen&label=反馈)](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/issues)
 [![Pull Requests](https://img.shields.io/github/issues-pr/DearCrazyLeaf/astrbot_plugin_steam_updates?color=blue&label=请求)](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pulls)
+[![QQ Group](https://img.shields.io/badge/点击加入QQ群-12B7F5?logo=tencentqq&logoColor=white&label=问题反馈和建议)](https://qm.qq.com/q/H3uUCEZKgg)
 [![GitHub Stars](https://img.shields.io/github/stars/DearCrazyLeaf/astrbot_plugin_steam_updates?color=yellow&label=标星)](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/stargazers)
 
 > [!IMPORTANT]
@@ -26,28 +40,38 @@
 
 ## ✅ 功能列表 | Features
 
+> [!NOTE]
+> 特别感谢 [@RhoninSeiei](https://github.com/RhoninSeiei) 为本插件提供维护和优化！
+
 - **被动推送**：自动轮询 Steam 更新日志
 - **多游戏**：支持多个 AppID 统一推送
-- **多平台推送**：支持使用 UMO 配置多个平台、多个同类型适配器实例、群聊、私聊和其他会话
+- **多平台推送**（[@RhoninSeiei](https://github.com/RhoninSeiei)）：支持使用 UMO 配置多个平台、多个同类型适配器实例、群聊、私聊和其他会话
 - **手动查询**：群内指令触发即时查询
 - **LLM整理**：可选用大模型同时翻译公告标题并整理正文，不增加额外模型请求
-- **逐条公告配图**：优先显示每条公告正文中的首张有效图片，失败时自动尝试后续候选并回退游戏头图
+- **逐条公告配图**（[@RhoninSeiei](https://github.com/RhoninSeiei)）：优先显示每条公告正文中的首张有效图片，失败时自动尝试后续候选并回退游戏头图
+- **自动过滤已标记的外部文章**：排除 News API 标记为 `is_external_url` 的新闻，以及 Feed 链接路径含 `externalpost` 的文章
 - **卡片/文本**：两种输出模式可选
 - **无更新静默**：当天无更新不推送
-- **限时免费领取活动**：支持将当前仍可领取的 Steam 游戏作为独立分区“限时免费领取”并入游戏更新推送
+- **限时免费领取活动**（[@RhoninSeiei](https://github.com/RhoninSeiei)）：支持将当前仍可领取的 Steam 游戏作为独立分区“限时免费领取”并入游戏更新推送
 - **创意工坊订阅监控**：支持轮询 Workshop PublishedFileID，发现更新时间变化后推送，支持查询非公开创意工坊内容
 
 <img width="600" alt="中文标题、正文整理与公告原图实际效果" src="docs/images/news-title-translation-and-image.png" />
 
 <img width="600" alt="公告图片与限时免费领取分区实际效果" src="docs/images/news-image-and-free-game.png" />
 
-<img width="600" alt="free_games_preview" src="docs/images/free_games_preview.png" />
+<img width="600" alt="免费游戏实际效果" src="docs/images/free_games_preview.png" />
 
-<img width="900" height="1184" alt="preview" src="https://github.com/user-attachments/assets/59a296a5-23f8-428f-9a32-72e38f64289c" />
+<img width="600" alt="游戏更新实际效果" src="https://github.com/user-attachments/assets/59a296a5-23f8-428f-9a32-72e38f64289c" />
 
-<img width="900" height="847" alt="workshop_public_3240880604_v4_spacing" src="https://github.com/user-attachments/assets/74d16dc0-f15e-41e8-9d59-50b25dca6231" />
+<img width="600" alt="创意工坊实际效果" src="https://github.com/user-attachments/assets/74d16dc0-f15e-41e8-9d59-50b25dca6231" />
 
 ---
+
+## 本地维护版
+
+当前版本为 `v1.3.7-local.2`，合入分会话订阅，保留本地轮询锁清理、明确发送失败与回执超时分类、共享名称查询取消隔离和任务退出等待。
+
+本地继续使用 `font/YaHei.ttf` 和 `font/YaHei-Bold.ttc`，未替换为上游精简字体。字体资产不包含在独立上游订阅 PR 中。
 
 ## 📦 安装 | Installation
 
@@ -75,8 +99,8 @@ AstrBot WebUI -> 插件 -> 插件配置
 | steam_web_api_key | Steam Web API Key（可选） |
 | enable_feed_fallback | 是否启用 Steam Feed 回退 |
 | feed_timeout_sec | Feed 回退超时秒数 |
-| game_query_concurrency | 游戏新闻并发上限，轮询和手动查询共享，默认 4，范围 1–8 |
-| appdetails_retry_attempts | 游戏名称查询最大尝试次数，默认 3，范围 1–5，间隔 2 秒 |
+| game_query_concurrency | 游戏新闻最大并发查询数，默认 `4`，范围 `1-8`；后台轮询和手动查询共享该上限 |
+| appdetails_retry_attempts | AppID 名称查询最大尝试次数，默认 `3`，范围 `1-5`；暂时性网络失败时每次间隔 2 秒重试 |
 | free_games_enable | 是否启用限时免费领取活动 |
 | free_games_manual_only_when_no_news | 手动查询在没有普通游戏更新时，是否仅返回“限时免费领取”分区 |
 | display_timezone | 免费领取截止时间显示时区；留空跟随容器系统时区，填写 IANA 时区名时按 UTC 活动源时间转换显示 |
@@ -99,10 +123,12 @@ AstrBot WebUI -> 插件 -> 插件配置
 | manual_query_workshop_command | 创意工坊手动查询指令（可配置多个） |
 | content_process_mode | 内容处理方式：`plugin` / `llm` |
 | llm_provider_id | LLM 提供商ID（可选，WebUI下拉选择） |
-| llm_timeout_sec | LLM 请求超时秒数（默认 `20`） |
+| llm_timeout_sec | LLM 请求超时秒数（默认 `30`，范围 `5-30`，超时后回退到插件内置处理） |
+| llm_input_max_chars | 单个游戏传给 LLM 的最大输入字数（默认 `8000`，范围 `1000-20000`；超出部分截断以控制模型输入量） |
+| llm_round_timeout_sec | 每轮 LLM 内容处理的总时间预算（默认 `90` 秒，范围 `30-300`；耗尽后剩余公告保留原文并标注） |
 | llm_prompt | LLM 提示词（仅 llm 模式生效） |
 | max_days | 每个游戏最多展示最近 N 天更新 |
-| content_max_chars | 单游戏正文最大字符数 |
+| content_max_chars | 单条公告正文最大字数 |
 | image_max_per_item | 每条更新最多渲染图片数（默认 1） |
 | image_max_height | 游戏头图、免费活动和创意工坊图片的最大高度；普通公告原图按比例和整卡像素预算处理 |
 | enable_app_headers | 是否启用游戏头图渲染 |
@@ -134,11 +160,15 @@ AstrBot WebUI -> 插件 -> 插件配置
 
 ## 🗂️ AppID 名称映射 | AppID Name Map
 
-插件根目录内的 `appid_map.json` 用于缓存和手动维护 AppID 对应名称（多语言）：
+> [!IMPORTANT]
+> 为了适应`Astrbot`的市场要求：从1.3.6版本开始，
+> 插件根目录内的 `appid_map.json` 只负责初次分发时读取默认映射，随后会写入新文件 `appid_name_map.json` 作为插件数据目录中的真实运行依赖，请注意备份旧 `appid_map.json` ！
 
-- 优先读取该文件中的名称
-- 若该 AppID 语言缺失，会自动通过 Steam API 获取并**写回同一条记录**
-- 不会覆盖已有语言条目（除非你手动修改）
+#### ⚠️ 从 `V1.3.6` 版本开始，插件目录结构发生改变！
+
+- 插件首次查询并成功获取名称后，会将映射保存到插件数据目录中的 `appid_name_map.json`
+- 从旧版本覆盖升级时，插件目录中的 `appid_map.json` 可能被新版文件替换，如果其中包含自定义映射或运行时缓存，请在升级前备份
+- 新版不会自动迁移旧文件中的映射，缺失的名称会在后续查询时重新联网获取并保存
 
 示例：
 ```json
@@ -186,74 +216,147 @@ mixin:
 
 ---
 
-## 📌 使用方法 | Usage
+## 📌 使用说明 | Usage
 
 ### 📣 自动推送
+- 开启 `enable_push` 后，插件会自动轮询并向 `notify_umos` 与旧 `notify_group_ids` 的合并目标发送更新。新字段先处理，旧字段随后处理；规范 UMO 相同的目标只发送一次
 
-当前维护版为 `v1.3.4-local.1`，整合上游 v1.3.4 查询改进，保留本地字体和生产可靠性修复。游戏名称查询失败会缓存 10 分钟；旧字符串名称缓存可继续读取。若回滚至不支持失败缓存对象的旧版，应同时恢复发布前的 `app_name_cache.json` 备份。人工 AppID 名称映射继续优先。
+- 若同时开启 `workshop_enable` 并配置 `workshop_item_ids`，会在同一轮询中检测创意工坊条目更新时间并合并推送
 
-图片明确发送失败时，仅向失败目标补发文字。发送接口超时或 NapCat 的 `sendMsg` 回执超时时，消息可能已经送达，插件会记录“送达不确定”，不再自动补发，并推进公告去重状态以避免下一轮重复推送。这种情况下，如果消息实际未送达，将不会自动重试。
-开启 enable_push 后，插件会自动轮询并向 notify_umos 与旧 notify_group_ids 的合并目标发送更新。新字段先处理，旧字段随后处理；规范 UMO 相同的目标只发送一次。
-若同时开启 `workshop_enable` 并配置 `workshop_item_ids`，会在同一轮询中检测创意工坊条目更新时间并合并推送
-游戏公告会按正文顺序提取图片候选并显示首张可用图片；图片保持原始比例，不裁剪、不拉伸，窄图保持原始尺寸并水平居中，全部候选失败时回退游戏头图
-使用 `llm` 内容处理模式时，同一次模型请求会同时返回中文公告标题和整理后的正文；解析器兼容空行、Markdown 围栏、同行标记及全角/半角冒号，并阻止协议标记进入最终卡片或文本
-若开启 `free_games_enable`，新的免费领取活动会在首次发现时主动推送一次；活动仍在领取期内时，只要同一轮存在普通游戏更新推送，就会作为独立分区“限时免费领取”附在游戏更新后面
-免费领取活动正文现在仅保留“截止时间”和“原价”
-免费领取活动在文本模式和卡片模式下均不会额外显示发布时间与链接
-即使某一轮免费领取活动正文仍混入旧版“领取方式”或“活动链接”，渲染阶段也会自动裁剪，只保留“截止时间”和“原价”
-`display_timezone` 留空时跟随容器系统时区；填写 IANA 时区名时，活动源时间会先按 UTC 解释，再转换为目标时区显示截止时间
-免费领取活动数据来自 GamerPower 公开接口：`https://www.gamerpower.com/api/giveaways?platform=steam&type=game`
-该功能已经经过线上轮询与手动查询验证，可通过 `free_games_enable` 独立开启或关闭
+- 游戏公告会按正文顺序提取图片候选并显示首张可用图片；图片保持原始比例，不裁剪、不拉伸，窄图保持原始尺寸并水平居中，全部候选失败时回退游戏头图
 
-### 🌐 UMO 推送目标
+- 卡片生成失败或平台明确返回发送失败时会回退为文字；如果发送回执超时、无法确认是否送达，则不在同一轮补发文字，并记录该目标的新闻状态以避免自动重推。未知结果可能意味着消息未送达，需要检查目标会话后再决定是否手动处理
 
-UMO 格式为 platform_id:message_type:session_id。可在目标会话发送 /sid 获取完整值。
+- 使用 `llm` 内容处理模式时，每个游戏的一次模型请求会按公告 ID 分别返回标题和整理后的正文；公告不会合并，原公告的 GID、发布时间、链接和图片均保留。模型输出会校验 ID、重复项和缺失项，异常项单独回退原文
 
-当前 AstrBot 常见消息类型包括 GroupMessage、FriendMessage 和 OtherMessage。插件使用 AstrBot 的 MessageSession 校验 UMO，因此接受当前运行版本认可的全部合法 UMO，后续版本增加的合法消息类型也会随运行版本生效。
+- LLM 输入会省略发布时间和链接，并受 `llm_input_max_chars` 限制；符合新逐条协议且所有公告均通过校验的成功结果会在插件数据目录缓存最多 24 小时（最多 256 条），旧版合并公告格式缓存不会复用，部分失败结果不会缓存
 
-多个同类型适配器必须填写各自的平台实例 ID，例如：
+- 单条 LLM 处理失败时只对该公告保留原文并标注失败原因；单个游戏查询失败会显示“Steam 查询失败，暂时无法获取公告”，与查询成功但没有更新区分。自动推送中的查询失败提示按目标冷却 6 小时，失败 AppID 不会被写入已处理状态，后续轮询仍会重试
+- 插件不会自动重试 LLM 请求；请求仍保持串行，单请求超时上限为 30 秒，每轮另有 `llm_round_timeout_sec` 总预算，避免多游戏处理无限延长。预算耗尽后剩余公告保留原文并标注，不再发起 LLM 请求
 
-    qq-account-1:GroupMessage:123456
-    qq-account-2:GroupMessage:123456
-    telegram-main:FriendMessage:987654
-    lark-main:OtherMessage:chat:thread:42
+- 若开启 `free_games_enable`，新的免费领取活动会在首次发现时主动推送一次；活动仍在领取期内时，只要同一轮存在普通游戏更新推送，就会作为独立分区“限时免费领取”附在游戏更新后面
 
-notify_umos 与 notify_group_ids 可以同时使用。notify_umos 中的目标优先；新旧目标规范化为 UMO 后保序去重。旧字段中的纯群号使用 platform_id 转换为 GroupMessage UMO，旧字段中已有的完整 UMO 继续按完整 UMO 解析。
+- 免费领取活动正文现在仅保留“截止时间”和“原价”
 
-主动消息能否发送取决于对应平台适配器的能力。AstrBot 的 QQ 官方 API 适配器不支持该主动发送接口。单个目标失败时，其余目标仍会继续发送。卡片图片失败时，文本只补发给该图片失败目标。全部目标均发送失败时，插件保留本轮轮询状态，等待后续再次发送。
+- 免费领取活动在文本模式和卡片模式下均不会额外显示发布时间与链接
 
-手动查询仍限群聊。当前事件的完整 UMO 命中配置，或者当前群号命中旧 notify_group_ids 中的纯群号时，群内命令可以执行。
+- 即使某一轮免费领取活动正文仍混入旧版“领取方式”或“活动链接”，渲染阶段也会自动裁剪，只保留“截止时间”和“原价”
+
+- `display_timezone` 留空时跟随容器系统时区；填写 IANA 时区名时，活动源时间会先按 UTC 解释，再转换为目标时区显示截止时间
+
+- 免费领取活动数据来自 GamerPower 公开接口：`https://www.gamerpower.com/api/giveaways?platform=steam&type=game`
+
+- 该功能已经经过线上轮询与手动查询验证，可通过 `free_games_enable` 独立开启或关闭
+
+### 🌐 UMO 推送目标（[@RhoninSeiei](https://github.com/RhoninSeiei)）
+
+- UMO 格式为 `platform_id:message_type:session_id`。可在目标会话发送 `/sid` 获取完整值。
+
+- 当前 AstrBot 常见消息类型包括 `GroupMessage`、`FriendMessage` 和 `OtherMessage`。插件使用 AstrBot 的 `MessageSession` 校验 UMO，因此接受当前运行版本认可的全部合法 UMO，后续版本增加的合法消息类型也会随运行版本生效。
+
+- 多个同类型适配器必须填写各自的平台实例 ID，例如：
+
+```text
+  > qq-account-1:GroupMessage:123456
+  > qq-account-2:GroupMessage:123456
+  > telegram-main:FriendMessage:987654
+  > lark-main:OtherMessage:chat:thread:42
+```
+
+- `notify_umos` 与 `notify_group_ids` 可以同时使用。`notify_umos` 中的目标优先；新旧目标规范化为 UMO 后保序去重。旧字段中的纯群号使用 `platform_id` 转换为 `GroupMessage` UMO，旧字段中已有的完整 UMO 继续按完整 UMO 解析。
+
+- 主动消息能否发送取决于对应平台适配器的能力。AstrBot 的 QQ 官方 API 适配器不支持该主动发送接口。单个目标失败时，其余目标仍会继续发送。卡片图片失败时，文本只补发给该图片失败目标。全部目标均发送失败时，插件保留本轮轮询状态，等待后续再次发送。
+
+- 手动查询仍限群聊。当前事件的完整 UMO 命中配置，或匹配旧 `notify_group_ids` 与 `platform_id` 组合时，群内命令可以执行。
+
+### 分会话订阅
+
+可以为每个完整 UMO 分别订阅游戏、创意工坊和免费领取通知，并选择图片或文字模式。不同平台实例即使群号相同也会分别管理。
+
+在插件配置中打开“分会话订阅 → 会话订阅列表”，添加“会话订阅”条目，填写会话备注、`/sid` 返回的完整 UMO、游戏 AppID 列表和创意工坊 ID 列表。免费领取与消息模式可继承全局设置。创意工坊、免费领取仍受各自全局总开关控制。
+
+- 未添加独立条目的旧 `notify_umos` 和 `notify_group_ids` 目标继续沿用全局订阅。
+- 独立条目的列表完整替换全局列表；空列表表示不订阅该类来源。
+- 关闭条目只暂停自动推送；清空订阅或暂停均不会重新继承全局列表。
+- 删除整个条目会恢复原全局目标规则。停止推送应使用“暂停”，不要通过删除条目实现。
+- 同一 UMO 请只保留一个条目；非法或重复条目会被拒绝执行并记录告警。
+- 新增来源首次成功查询时建立去重基线，不自动补推历史；可用手动查询查看当前内容。首次抓取失败会继续重试，不会记录错误的空基线。
+- 各目标独立记录游戏、创意工坊和免费领取的投递状态。明确发送失败的目标后续重试，已成功或结果不确定的目标不会因此重复接收。
+
+当前会话命令：
+
+| 命令 | 说明 |
+| --- | --- |
+| `/STEAM订阅 列表` | 查看当前会话的有效订阅，也可直接发送 `/STEAM订阅` |
+| `/STEAM订阅 添加 游戏 730 570` | 添加一个或多个游戏 AppID |
+| `/STEAM订阅 删除 游戏 730` | 取消指定游戏，最后一个取消后保留空规则 |
+| `/STEAM订阅 添加 创意工坊 123456789` | 添加创意工坊条目；删除时将“添加”替换为“删除” |
+| `/STEAM订阅 免费领取 开启` | 支持“开启”“关闭”“继承” |
+| `/STEAM订阅 模式 图片` | 支持“图片”“文字”“继承” |
+| `/STEAM订阅 暂停` | 暂停当前会话自动推送，保留订阅，可继续手动查询 |
+| `/STEAM订阅 恢复` | 恢复推送并建立当前基线，避免补发暂停期间积压 |
+| `/STEAM订阅 恢复全局 确认` | 移除独立规则；是否继续推送取决于原全局目标列表 |
+
+英文入口为 `/steam_sub`，参数与中文入口相同。现有 `STEAM更新`、`创意工坊更新` 及自定义查询别名保留，按当前会话订阅查询。
+
+普通成员可查看本会话列表。修改订阅仅允许 AstrBot 管理员或通过适配器群信息验证的本群群主、管理员；私聊和无法可靠获取群角色的平台仅允许 AstrBot 管理员修改。群管理员不能指定其他 UMO。
+
+AstrBot 管理员可使用 `/STEAM全局订阅 列表` 查看全部有效规则，或指定完整 UMO 管理：
+
+```text
+/STEAM全局订阅 "qq-main:GroupMessage:123456" 添加 游戏 730
+/STEAM全局订阅 「bot with space:GroupMessage:123456」 暂停
+```
+
+英文入口为 `/steam_sub_global`。UMO 中包含空格时使用引号或 `「」`。每个会话每类来源最多配置 100 个 ID。
+
+命令和界面写入同一个 `subscription_settings.sessions` 配置字段。命令成功后刷新已打开的配置页面再编辑，避免旧表单保存覆盖新设置；界面沿用 AstrBot 的保存、重载流程。订阅变化在发送前再次校验，但已进入平台发送接口的消息无法撤回。
+
+首次轮询迁移前会在插件数据目录保留 `state.before-subscriptions-v1.json`；旧目标沿用已有投递基线，新状态按 UMO 隔离。回滚旧版时应在停止插件后恢复对应的状态备份，避免旧版误用新投递状态。
+
+### 开发验证
+
+安装 `requirements.txt` 后运行 `python -m unittest discover -s tests -v`。测试使用临时目录和替代发送端，不向真实群发消息。在隔离 AstrBot 环境中另运行 `python tests/smoke_core.py`，验证真实命令参数解析、原生配置模板与保存回读。新增功能不要求更换现有字体。
 
 ### 💬 手动查询
 群内发送任一配置指令即可触发，例如：
 ```
-STEAM更新
-steam更新
-cs2更新
+  > STEAM更新
+  > steam更新
+  > cs2更新
 ```
-当没有普通游戏更新但存在仍可领取的免费游戏时，`free_games_manual_only_when_no_news` 默认为开启，此时仅返回“限时免费领取”分区
-如果将 `free_games_manual_only_when_no_news` 设为关闭，当天没有普通游戏更新时，命令会回退展示较早的游戏更新，并在该回退结果后附上“限时免费领取”分区
-如果未配置游戏 AppID 但仍启用 `free_games_enable`，手动查询会继续返回当前有效的“限时免费领取”分区
-免费领取活动标题优先显示接口原始名称；如果可解析到 Steam 官方中文名，则显示为 `原始标题（官方中文名）`
+- 当没有普通游戏更新但存在仍可领取的免费游戏时，`free_games_manual_only_when_no_news` 默认为开启，此时仅返回“限时免费领取”分区
+
+- 如果将 `free_games_manual_only_when_no_news` 设为关闭，当天没有普通游戏更新时，命令会回退展示较早的游戏更新，并在该回退结果后附上“限时免费领取”分区
+
+- 如果未配置游戏 AppID 但仍启用 `free_games_enable`，手动查询会继续返回当前有效的“限时免费领取”分区
+
+- 免费领取活动标题优先显示接口原始名称；如果可解析到 Steam 官方中文名，则显示为 `原始标题（官方中文名）`
 
 ### 🛰️ 平台捕获
+
+当不清楚当前会话的完整 UMO 时，可在群内发送：
+
 ```
-steam_update_ping
+  > steam_update_ping
 ```
-steam_update_ping 只为旧纯群号兼容模式捕获平台实例 ID 和 aiocqhttp bot。完整 UMO 使用自身的平台实例 ID，无需依赖该命令。
+
+> [!NOTE]
+> `steam_update_ping` 只为旧纯群号兼容模式捕获平台实例 ID 和 aiocqhttp bot
+> 完整 UMO 使用自身的平台实例 ID，无需依赖该命令
 
 ---
 
-## 🖼️ 输出模式 | Render Modes
+## ❤️ 贡献者 | contributors
 
-- `card`：图片卡片（推荐）
-- `text`：纯文本输出
+<a href="https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=DearCrazyLeaf/astrbot_plugin_steam_updates&max=300&columns=15" alt="Contributors" />
+</a>
 
----
 
-## 📜 License
+## 📜 许可证 | License
 
-GPL-3.0
+[![GPL-3.0 License](https://img.shields.io/badge/License-GPL--3.0-orange?style=for-the-badge)](https://www.gnu.org/licenses/gpl-3.0.txt)
 
 ---
 

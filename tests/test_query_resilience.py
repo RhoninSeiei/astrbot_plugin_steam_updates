@@ -18,6 +18,7 @@ class QueryResilienceTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.mod.StarTools, "get_data_dir", return_value=self.root):
             self.plugin = self.mod.SteamUpdatePush(None, {})
         self.plugin._appid_map_path = lambda: self.root / "appid_map.json"
+        self.plugin._bundled_appid_map_path = lambda: self.root / "bundled_appid_map.json"
         self.plugin._client = object()
 
     async def asyncTearDown(self):
@@ -157,8 +158,10 @@ class QueryResilienceTest(unittest.IsolatedAsyncioTestCase):
             self.plugin._fetch_news_for_appids(["1", "2", "bad"], 2, only_today=True),
             self.plugin._fetch_news_for_appids(["3", "4"], 2, only_today=False),
         )
-        self.assertEqual(list(one), ["1", "2"])
-        self.assertEqual(list(two), ["3", "4"])
+        self.assertEqual(list(one[0]), ["1", "2"])
+        self.assertEqual(one[1], {"bad"})
+        self.assertEqual(list(two[0]), ["3", "4"])
+        self.assertEqual(two[1], set())
         self.assertEqual(maximum, 2)
         self.assertEqual(self.plugin._normalize_appids(["1", " 2 ", "1", ""]), ["1", "2"])
 

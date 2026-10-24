@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 import unittest
 import xml.etree.ElementTree as ET
@@ -12,7 +13,7 @@ from PIL import ImageFile as RealImageFile
 from PIL import ImageFont as RealImageFont
 from PIL import PngImagePlugin as RealPngImagePlugin
 
-from tests.test_free_games import _load_module
+from support import _load_module
 
 
 class _ImmediateExecutorLoop:
@@ -234,13 +235,30 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
             plugin._item_image_candidates(sections[0].updates[0]), [first, second]
         )
 
-    async def test_llm_merge_keeps_first_source_image_reference(self):
+    async def test_llm_preserves_each_announcements_own_image_reference(self):
         plugin = self._make_plugin()
         plugin._resolve_app_names = self._async_return({"123": "Game"})
         plugin._cfg = lambda key, default=None: (
             "{content}" if key == "llm_prompt" else default
         )
-        plugin._call_llm = self._async_return("Summary")
+        plugin._call_llm = self._async_return(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": "6b86b273ff34fce1",
+                            "title": "第一条",
+                            "content": "正文一",
+                        },
+                        {
+                            "id": "d4735e3a265e16ee",
+                            "title": "第二条",
+                            "content": "正文二",
+                        },
+                    ]
+                }
+            )
+        )
         items = [
             self.mod.NewsItem("1", "First", "url-1", "one", 1, "123"),
             self.mod.NewsItem(
@@ -257,11 +275,16 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
         sections = await plugin._build_sections_llm(["123"], {"123": items}, None)
 
         self.assertEqual(
-            sections[0].updates[0].image_url,
+            sections[0].updates[1].image_url,
             "https://clan.fastly.steamstatic.com/images/4437469/banner.png",
         )
+        self.assertEqual(sections[0].updates[0].image_url, "")
+        self.assertEqual([i.gid for i in sections[0].updates], ["1", "2"])
+        self.assertEqual(
+            [i.contents for i in sections[0].updates], ["正文一", "正文二"]
+        )
 
-    async def test_merged_llm_summary_keeps_all_source_chains_in_order(self):
+    async def test_per_announcement_llm_keeps_separate_source_chains(self):
         plugin = self._make_plugin()
         urls = [
             "https://clan.fastly.steamstatic.com/images/100/a.png",
@@ -273,7 +296,24 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
         plugin._cfg = lambda key, default=None: (
             "{content}" if key == "llm_prompt" else default
         )
-        plugin._call_llm = self._async_return("Summary")
+        plugin._call_llm = self._async_return(
+            json.dumps(
+                {
+                    "items": [
+                        {
+                            "id": "6b86b273ff34fce1",
+                            "title": "第一条",
+                            "content": "正文一",
+                        },
+                        {
+                            "id": "d4735e3a265e16ee",
+                            "title": "第二条",
+                            "content": "正文二",
+                        },
+                    ]
+                }
+            )
+        )
         items = [
             self.mod.NewsItem(
                 "1",
@@ -283,6 +323,7 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
                 1,
                 "123",
                 urls[0],
+                tuple(urls[:2]),
             ),
             self.mod.NewsItem(
                 "2",
@@ -292,6 +333,7 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
                 2,
                 "123",
                 urls[2],
+                tuple(urls[2:]),
             ),
         ]
 
@@ -299,7 +341,10 @@ class NewsImageParsingTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             plugin._item_image_candidates(sections[0].updates[0]),
-            urls,
+            urls[:2],
+        )
+        self.assertEqual(
+            plugin._item_image_candidates(sections[0].updates[1]), urls[2:]
         )
 
     @staticmethod

@@ -45,6 +45,7 @@ class NotifyTargetsTest(unittest.TestCase):
 
     def _make_plugin(self, config=None):
         plugin = object.__new__(self.mod.SteamUpdatePush)
+        plugin._stop_event = asyncio.Event()
         values = dict(config or {})
         plugin.config = values
         plugin._cfg = lambda key, default=None: values.get(key, default)
@@ -528,7 +529,7 @@ class NotifyTargetsTest(unittest.TestCase):
             ],
         )
 
-    def test_manual_permission_uses_full_umo_or_legacy_group_id(self):
+    def test_manual_permission_requires_legacy_platform_and_group_to_match(self):
         plugin = self._make_plugin(
             {
                 "notify_umos": ["qq-a:GroupMessage:100"],
@@ -546,7 +547,7 @@ class NotifyTargetsTest(unittest.TestCase):
                 "100",
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             plugin._manual_query_allowed(
                 "qq-z:GroupMessage:200",
                 "200",
@@ -675,7 +676,9 @@ class NotifyTargetsTest(unittest.TestCase):
 
         asyncio.run(plugin._poll_once())
 
-        self.assertFalse(hasattr(plugin, "_saved_state"))
+        # Migration may persist baselines, but failed delivery must not consume n1.
+        self.assertFalse(any("n1" in value for key, value in plugin._saved_state.items()
+                             if key.startswith("delivery:")))
 
     def test_poll_partial_text_success_saves_global_state(self):
         plugin = self._make_poll_plugin()
@@ -762,7 +765,7 @@ class NotifyContractTest(unittest.TestCase):
             "OtherMessage",
             "steam_update_ping",
         ):
-            self.assertIn(marker, readme)
+            self.assertIn(marker, readme.replace("`", ""))
 
         for marker in (
             "notify_umos 中的目标优先",
@@ -773,7 +776,7 @@ class NotifyContractTest(unittest.TestCase):
             "全部目标均发送失败时，插件保留本轮轮询状态",
             "手动查询仍限群聊",
         ):
-            self.assertIn(marker, readme)
+            self.assertIn(marker, readme.replace("`", ""))
 
         changelog = (ROOT / "CHANGELOG.md").read_text(
             encoding="utf-8"

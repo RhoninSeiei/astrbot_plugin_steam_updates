@@ -14,7 +14,7 @@ import uuid
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,10 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
+
+from astrbot.core.star.filter.command import GreedyStr
+from .subscriptions import SubscriptionMixin
+from .subscription_polling import SubscriptionPollingMixin
 
 PLUGIN_ID = "astrbot_plugin_steam_updates"
 STEAM_NEWS_API = "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/"
@@ -68,6 +72,7 @@ class NewsItem:
     appid: str = ""
     image_url: str = ""
     image_candidates: tuple[str, ...] = ()
+    llm_notice: str = ""
 
 
 @dataclass
@@ -75,6 +80,8 @@ class AppSection:
     appid: str
     title: str
     updates: list[NewsItem]
+    llm_fallback: bool = False
+    query_error: str = ""
 
 
 @dataclass
@@ -103,7 +110,7 @@ class PushResult:
     uncertain: list[NotifyTarget] = field(default_factory=list)
 
 
-class SteamUpdatePush(Star):
+class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
     _CFG_GROUP_KEYS = (
         "basic_settings",
         "game_updates",
@@ -139,6 +146,9 @@ class SteamUpdatePush(Star):
         self._appid_name_map: dict[str, Any] | None = None
         self._name_cache: dict[str, Any] | None = None
         self._name_cache_path = self._data_dir / "app_name_cache.json"
+        self._llm_cache_path = self._data_dir / "llm_result_cache.json"
+        self._llm_cache: dict[str, dict[str, Any]] | None = None
+        self._llm_inflight: dict[str, asyncio.Task[str | None]] = {}
         self._app_name_inflight: dict[str, asyncio.Task[str]] = {}
         self._name_cache_lock: asyncio.Lock | None = None
         self._trace_seq = 0
@@ -151,7 +161,6 @@ class SteamUpdatePush(Star):
         self._poll_instance_path = self._data_dir / ".poll.instance"
         self._poll_instance_token = ""
 
-
     # --- lifecycle ---
     async def initialize(self):
         await self._ensure_http_client()
@@ -161,6 +170,7 @@ class SteamUpdatePush(Star):
         self._claim_poll_instance()
         self._poll_task = asyncio.create_task(self._poll_loop())
 
+
     async def terminate(self):
         self._stop_event.set()
         if self._poll_task:
@@ -169,16 +179,19 @@ class SteamUpdatePush(Star):
         self._release_poll_lock()
         self._release_poll_instance_claim()
         inflight = getattr(self, "_app_name_inflight", {})
-        tasks = list(inflight.values())
+        llm_inflight = getattr(self, "_llm_inflight", {})
+        tasks = list(inflight.values()) + list(llm_inflight.values())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         inflight.clear()
+        llm_inflight.clear()
         if self._client:
             await self._client.aclose()
         self._client = None
         self._client_signature = ""
+
 
     def _try_acquire_poll_lock(self) -> bool:
         if fcntl is None:
@@ -298,6 +311,7 @@ class SteamUpdatePush(Star):
             self._log_warn("poll", "cancelled legacy poll tasks", count=cancelled)
         return cancelled
 
+
     async def _finish_legacy_poll_tasks(self) -> None:
         retired = self._retired_poll_tasks
         if not retired:
@@ -311,6 +325,7 @@ class SteamUpdatePush(Star):
             # resources only after their coroutine has actually stopped.
             await owner.terminate()
         self._retired_poll_tasks = []
+
 
     def _recover_orphan_poll_locks(self) -> None:
         """Recover locks leaked by already-cancelled pre-fix tasks on Linux.
@@ -346,6 +361,37 @@ class SteamUpdatePush(Star):
                 continue
         if recovered:
             self._log_warn("poll", "recovered orphaned same-process locks", count=recovered)
+
+
+    async def _run_poll_loop(self):
+        while not self._stop_event.is_set():
+            if not self._is_current_poll_instance():
+                self._release_poll_lock()
+                self._log_warn("poll", "stale poll instance detected; exiting loop")
+                break
+            now = datetime.now().astimezone()
+            next_run = self._next_poll_time(now)
+            wait_sec = max(0, (next_run - now).total_seconds())
+            self._log_debug("poll", "next schedule", now=now.isoformat(), next=next_run.isoformat(), wait_sec=int(wait_sec))
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=wait_sec)
+                if self._stop_event.is_set():
+                    break
+            except asyncio.TimeoutError:
+                pass
+            if not self._is_current_poll_instance():
+                self._release_poll_lock()
+                self._log_warn("poll", "stale poll instance detected before execution")
+                break
+            if not self._try_acquire_poll_lock():
+                self._log_warn("poll", "skip: lock held by another instance")
+                continue
+            try:
+                await self._poll_once()
+                logger.info("[steam_updates][poll] cycle completed")
+            except Exception:
+                logger.exception("[steam_updates][poll] loop execution failed")
+
 
     # --- config helpers ---
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -507,35 +553,11 @@ class SteamUpdatePush(Star):
             )
         return targets
 
-    def _manual_query_allowed(
-        self,
-        event_umo: str,
-        group_id: str,
-    ) -> bool:
-        legacy_values = self._cfg_list_values("notify_group_ids")
-        if group_id and group_id in {
-            value
-            for value in legacy_values
-            if value and ":" not in value
-        }:
-            return True
+    def _manual_query_allowed(self, event_umo: str, group_id: str) -> bool:
         try:
-            normalized_event = str(MessageSession.from_str(event_umo))
-        except Exception:
+            return self._subscription_target(event_umo).umo in self._resolve_subscriptions()
+        except ValueError:
             return False
-
-        configured_full = self._cfg_list_values("notify_umos")
-        configured_full.extend(
-            value for value in legacy_values if ":" in value
-        )
-        for index, value in enumerate(configured_full, start=1):
-            target = self._parse_notify_target(
-                value,
-                target_index=index,
-            )
-            if target is not None and target.umo == normalized_event:
-                return True
-        return False
 
     def _debug(self, msg: str):
         if self._cfg("debug_log", False):
@@ -600,7 +622,6 @@ class SteamUpdatePush(Star):
                 error=exc,
             )
             return httpx.AsyncClient(timeout=timeout, limits=limits, trust_env=False)
-
 
     def _http_client_signature(self) -> str:
         return f"{self._proxy_mode()}|{self._proxy_url()}"
@@ -674,7 +695,6 @@ class SteamUpdatePush(Star):
             ) as client:
                 return await client.request(method, url, **kwargs)
 
-
     def _next_trace_id(self, prefix: str) -> str:
         self._trace_seq = (self._trace_seq + 1) % 1_000_000
         return f"{prefix}-{datetime.now().strftime('%H%M%S')}-{self._trace_seq:06d}"
@@ -735,6 +755,26 @@ class SteamUpdatePush(Star):
             timeout = 10
         return max(3, min(timeout, 60))
 
+    def _game_query_concurrency(self) -> int:
+        try:
+            value = int(self._cfg("game_query_concurrency", 4))
+        except Exception:
+            value = 4
+        return max(1, min(value, 8))
+
+    def _get_news_query_semaphore(self) -> asyncio.Semaphore:
+        limit = self._game_query_concurrency()
+        semaphore = getattr(self, "_news_query_semaphore", None)
+        semaphore_limit = getattr(self, "_news_query_semaphore_limit", None)
+        if (
+            semaphore is None
+            or semaphore_limit != limit
+        ):
+            semaphore = asyncio.Semaphore(limit)
+            self._news_query_semaphore = semaphore
+            self._news_query_semaphore_limit = limit
+        return semaphore
+
     def _workshop_enabled(self) -> bool:
         return bool(self._cfg("workshop_enable", False))
 
@@ -767,10 +807,17 @@ class SteamUpdatePush(Star):
 
     def _llm_timeout_sec(self) -> int:
         try:
-            value = int(self._cfg("llm_timeout_sec", 20))
+            value = int(self._cfg("llm_timeout_sec", 30))
         except Exception:
-            value = 20
-        return max(5, min(value, 180))
+            value = 30
+        return max(5, min(value, 30))
+
+    def _llm_round_timeout_sec(self) -> int:
+        try:
+            value = int(self._cfg("llm_round_timeout_sec", 90))
+        except (TypeError, ValueError):
+            value = 90
+        return max(30, min(value, 300))
 
     def _workshop_push_on_first_seen(self) -> bool:
         return bool(self._cfg("workshop_push_on_first_seen", False))
@@ -919,13 +966,18 @@ class SteamUpdatePush(Star):
             return {}
 
     def _save_state(self, state: dict[str, str]) -> None:
+        temporary = self._state_path.with_name(self._state_path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
-            self._state_path.write_text(
-                json.dumps(state, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(state, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self._state_path)
         except Exception as exc:
-            self._debug(f"save state failed: {exc}")
+            self._log_warn("state", "state persistence failed", error_type=type(exc).__name__)
+            raise
+        finally:
+            temporary.unlink(missing_ok=True)
 
     # --- polling ---
     async def _poll_loop(self):
@@ -935,301 +987,6 @@ class SteamUpdatePush(Star):
             self._release_poll_lock()
             self._release_poll_instance_claim()
 
-    async def _run_poll_loop(self):
-        while not self._stop_event.is_set():
-            if not self._is_current_poll_instance():
-                self._release_poll_lock()
-                self._log_warn("poll", "stale poll instance detected; exiting loop")
-                break
-            now = datetime.now().astimezone()
-            next_run = self._next_poll_time(now)
-            wait_sec = max(0, (next_run - now).total_seconds())
-            self._log_debug("poll", "next schedule", now=now.isoformat(), next=next_run.isoformat(), wait_sec=int(wait_sec))
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=wait_sec)
-                if self._stop_event.is_set():
-                    break
-            except asyncio.TimeoutError:
-                pass
-            if not self._is_current_poll_instance():
-                self._release_poll_lock()
-                self._log_warn("poll", "stale poll instance detected before execution")
-                break
-            if not self._try_acquire_poll_lock():
-                self._log_warn("poll", "skip: lock held by another instance")
-                continue
-            try:
-                await self._poll_once()
-                logger.info("[steam_updates][poll] cycle completed")
-            except Exception:
-                logger.exception("[steam_updates][poll] loop execution failed")
-
-    async def _poll_once(self):
-        trace = self._next_trace_id("poll")
-        self._log_debug("poll", "start", trace=trace)
-        if not self._is_current_poll_instance():
-            self._log_warn(
-                "poll",
-                "skip: stale poll instance",
-                trace=trace,
-            )
-            return
-        if not bool(self._cfg("enable_push", True)):
-            self._log_debug(
-                "poll",
-                "skip: plugin disabled",
-                trace=trace,
-            )
-            return
-        targets = self._resolve_notify_targets()
-        if not targets:
-            self._log_debug(
-                "poll",
-                "skip: no valid notification targets",
-                trace=trace,
-            )
-            return
-        await self._ensure_http_client()
-        appids = self._normalize_appids(self._cfg("steam_appids", []))
-        free_games_enabled = self._free_games_enabled()
-        workshop_ids = self._normalize_workshop_item_ids(self._cfg("workshop_item_ids", []))
-        workshop_enabled = self._workshop_enabled() and bool(workshop_ids)
-        if not appids and not workshop_enabled and not free_games_enabled:
-            self._log_debug("poll", "skip: steam_appids/workshop/free_games all empty", trace=trace)
-            return
-
-        state = self._load_state()
-        max_days = self._get_max_days()
-        # Ensure enough items to cover all updates of today (Steam API has an upper bound).
-        fetch_count = max(max_days, 50)
-        self._log_debug(
-            "poll",
-            "resolved config",
-            trace=trace,
-            app_count=len(appids),
-            workshop_count=len(workshop_ids) if workshop_enabled else 0,
-            target_count=len(targets),
-            max_days=max_days,
-            fetch_count=fetch_count,
-        )
-        updates_by_app: dict[str, list[NewsItem]] = {}
-        app_state_updates: dict[str, str] = {}
-        fetched_updates = await self._fetch_news_for_appids(
-            appids,
-            fetch_count,
-            only_today=True,
-            trace=trace,
-        )
-        for appid in appids:
-            items = fetched_updates.get(appid, [])
-            if not items:
-                self._log_debug("poll", "appid has no updates", trace=trace, appid=appid)
-                continue
-
-            filtered_items = self._filter_recent_days(items, max_days)
-            if not filtered_items:
-                self._log_debug("poll", "appid has no recent updates", trace=trace, appid=appid)
-                continue
-
-            latest_gid = filtered_items[0].gid
-            seen_key = self._news_seen_state_key(appid)
-            seen_gids = self._decode_news_seen_state(state.get(seen_key, ""))
-            legacy_gid = str(state.get(appid, "")).strip()
-
-            if seen_gids:
-                seen_set = set(seen_gids)
-                unseen_items = [item for item in filtered_items if item.gid not in seen_set]
-            elif legacy_gid:
-                boundary_idx = next((idx for idx, item in enumerate(filtered_items) if item.gid == legacy_gid), -1)
-                if boundary_idx >= 0:
-                    unseen_items = filtered_items[:boundary_idx]
-                else:
-                    unseen_items = [item for item in filtered_items if item.gid != legacy_gid]
-            else:
-                unseen_items = filtered_items
-
-            app_state_updates[appid] = latest_gid
-            app_state_updates[seen_key] = self._encode_news_seen_state(filtered_items)
-
-            if not unseen_items:
-                self._log_debug(
-                    "poll",
-                    "appid unchanged",
-                    trace=trace,
-                    appid=appid,
-                    gid=latest_gid,
-                )
-                continue
-
-            updates_by_app[appid] = unseen_items
-
-        workshop_updates: list[NewsItem] = []
-        workshop_state_updates: dict[str, str] = {}
-        if workshop_enabled:
-            workshop_updates, workshop_state_updates = await self._collect_workshop_updates_for_poll(state)
-            self._log_debug(
-                "poll",
-                "workshop collected",
-                trace=trace,
-                update_count=len(workshop_updates),
-                state_update_count=len(workshop_state_updates),
-            )
-
-        free_game_items_result = await self._fetch_free_game_items() if free_games_enabled else []
-        free_game_items = list(free_game_items_result or [])
-        free_game_state_updates: dict[str, str] = {}
-        new_free_game_items: list[NewsItem] = []
-        selected_free_game_items = self.PollFreeGameSelection(
-            attached_items=[],
-            standalone_items=[],
-        )
-        if free_games_enabled and free_game_items_result is not None:
-            free_state_key = self._free_games_state_key()
-            previous_free_gids = self._decode_news_seen_state(state.get(free_state_key, ""))
-            new_free_game_items, free_snapshot = self._split_new_free_game_items(
-                free_game_items,
-                previous_free_gids,
-            )
-            selected_free_game_items = self._select_poll_free_game_items(
-                has_game_updates=bool(updates_by_app),
-                active_items=free_game_items,
-                new_items=new_free_game_items,
-            )
-            free_game_state_updates[free_state_key] = json.dumps(free_snapshot, ensure_ascii=False)
-            self._log_debug(
-                "free_games",
-                "poll collected",
-                trace=trace,
-                active_count=len(free_game_items),
-                new_count=len(new_free_game_items),
-                attached_count=len(selected_free_game_items.attached_items),
-                standalone_count=len(selected_free_game_items.standalone_items),
-            )
-        elif free_games_enabled:
-            self._log_debug(
-                "free_games",
-                "poll skipped snapshot update due fetch failure",
-                trace=trace,
-            )
-
-        if not updates_by_app and not workshop_updates and not selected_free_game_items.standalone_items:
-            self._log_debug("poll", "no app/workshop/standalone_free_game has updates", trace=trace)
-            if workshop_state_updates:
-                state.update(workshop_state_updates)
-            if free_game_state_updates:
-                state.update(free_game_state_updates)
-            if not self._is_current_poll_instance():
-                self._log_warn("poll", "skip state update: stale poll instance", trace=trace)
-                return
-            self._save_state(state)
-            return
-        self._log_debug(
-            "poll",
-            "updates collected",
-            trace=trace,
-            app_count=len(updates_by_app),
-            workshop_update_count=len(workshop_updates),
-            free_game_new_count=len(new_free_game_items),
-            free_game_attached_count=len(selected_free_game_items.attached_items),
-            free_game_standalone_count=len(selected_free_game_items.standalone_items),
-            targets=len(targets),
-        )
-        if not self._is_current_poll_instance():
-            self._log_warn("poll", "abort push: stale poll instance", trace=trace)
-            return
-
-        payload_batches: list[tuple[str, list[AppSection]]] = []
-        if updates_by_app:
-            updated_appids = [aid for aid in appids if aid in updates_by_app]
-            game_sections = await self._build_sections(updated_appids, updates_by_app) if updated_appids else []
-            merged_game_sections = self._merge_game_sections_with_free_games(
-                game_sections,
-                selected_free_game_items.attached_items,
-                free_only_when_no_news=True,
-            )
-            if merged_game_sections:
-                payload_batches.append(("game", merged_game_sections))
-        elif selected_free_game_items.standalone_items:
-            free_only_sections = self._merge_game_sections_with_free_games(
-                [],
-                selected_free_game_items.standalone_items,
-                free_only_when_no_news=True,
-            )
-            if free_only_sections:
-                payload_batches.append(("game", free_only_sections))
-        if workshop_updates:
-            workshop_sections = await self._build_workshop_sections(workshop_updates)
-            payload_batches.append(("workshop", workshop_sections))
-
-        query_text = datetime.now().strftime("%Y/%m/%d %H:%M")
-        mode = str(self._cfg("message_mode", "card")).lower()
-        push_results: list[PushResult] = []
-        for card_kind, sections in payload_batches:
-            latest_ts = max(
-                (
-                    item.date
-                    for sec in sections
-                    for item in sec.updates
-                    if item.date
-                ),
-                default=int(datetime.now().timestamp()),
-            )
-            publish_text = datetime.fromtimestamp(
-                latest_ts
-            ).strftime("%Y/%m/%d %H:%M")
-            result = await self._deliver_poll_payload(
-                targets,
-                sections,
-                publish_text,
-                query_text,
-                card_kind,
-                mode,
-            )
-            push_results.append(result)
-            if result.failed:
-                self._log_warn(
-                    "poll",
-                    "payload has failed targets",
-                    trace=trace,
-                    card_kind=card_kind,
-                    failed_count=len(result.failed),
-                    succeeded_count=len(result.succeeded),
-                )
-        self._log_debug(
-            "poll",
-            "push finished",
-            trace=trace,
-            app_count=len(updates_by_app),
-            workshop_update_count=len(workshop_updates),
-            free_game_attached_count=len(selected_free_game_items.attached_items),
-            free_game_standalone_count=len(selected_free_game_items.standalone_items),
-            payload_count=len(payload_batches),
-            targets=len(targets),
-        )
-
-        if not any(result.succeeded or result.uncertain for result in push_results):
-            self._log_warn(
-                "poll",
-                "all notification sends failed; state preserved",
-                trace=trace,
-                payload_count=len(payload_batches),
-                target_count=len(targets),
-            )
-            return
-
-        # update state only after push
-        if app_state_updates:
-            state.update(app_state_updates)
-        if workshop_state_updates:
-            state.update(workshop_state_updates)
-        if free_game_state_updates:
-            state.update(free_game_state_updates)
-
-        if not self._is_current_poll_instance():
-            self._log_warn("poll", "skip final state update: stale poll instance", trace=trace)
-            return
-        self._save_state(state)
-        self._log_debug("poll", "state updated", trace=trace, state_size=len(state))
 
 
     async def _deliver_poll_payload(
@@ -1285,7 +1042,8 @@ class SteamUpdatePush(Star):
         succeeded_targets = set(image_result.succeeded)
         succeeded_targets.update(text_result.succeeded)
         failed_targets = set(text_result.failed)
-        uncertain_targets = set(image_result.uncertain) | set(text_result.uncertain)
+        uncertain_targets = set(image_result.uncertain)
+        uncertain_targets.update(text_result.uncertain)
         return PushResult(
             succeeded=[
                 target for target in targets
@@ -1295,10 +1053,21 @@ class SteamUpdatePush(Star):
                 target for target in targets
                 if target in failed_targets
             ],
-            uncertain=[target for target in targets if target in uncertain_targets],
+            uncertain=[
+                target for target in targets
+                if target in uncertain_targets
+            ],
         )
 
     async def _manual_query(self, umo: str | None = None, query_kind: str = "all"):
+        profile = None
+        if umo is not None:
+            try:
+                profile = self._resolve_subscriptions().get(self._subscription_target(umo).umo)
+            except ValueError:
+                return None, "会话订阅配置无效"
+            if profile is None:
+                return None, "当前会话尚未订阅"
         await self._ensure_http_client()
         trace = self._next_trace_id("manual")
         kind = str(query_kind or "all").strip().lower()
@@ -1306,10 +1075,10 @@ class SteamUpdatePush(Star):
             kind = "all"
         want_game = kind in {"all", "game"}
         want_workshop = kind in {"all", "workshop"}
-        want_free_games = want_game and self._free_games_enabled()
+        want_free_games = want_game and (profile.free_games if profile else self._free_games_enabled())
 
-        appids = self._normalize_appids(self._cfg("steam_appids", []))
-        workshop_ids = self._normalize_workshop_item_ids(self._cfg("workshop_item_ids", []))
+        appids = list(profile.games) if profile else self._normalize_appids(self._cfg("steam_appids", []))
+        workshop_ids = list(profile.workshop) if profile else self._normalize_workshop_item_ids(self._cfg("workshop_item_ids", []))
         workshop_enabled = want_workshop and self._workshop_enabled() and bool(workshop_ids)
         game_source_available = bool(appids) or want_free_games
 
@@ -1342,8 +1111,9 @@ class SteamUpdatePush(Star):
         )
 
         updates_by_app: dict[str, list[NewsItem]] = {}
+        failed_appids: set[str] = set()
         if want_game:
-            fetched_updates = await self._fetch_news_for_appids(
+            fetched_updates, failed_appids = await self._fetch_news_for_appids(
                 appids,
                 fetch_count,
                 only_today=True,
@@ -1356,12 +1126,19 @@ class SteamUpdatePush(Star):
                     continue
                 updates_by_app[appid] = items
 
-        workshop_all = await self._fetch_workshop_news_items() if workshop_enabled else []
+        workshop_all = await self._fetch_workshop_news_items(workshop_ids) if workshop_enabled else []
         workshop_updates = self._filter_today_items(workshop_all) if workshop_all else []
         free_game_items_result = await self._fetch_free_game_items() if want_free_games else []
         free_game_items = list(free_game_items_result or [])
 
-        if want_game and free_game_items and not updates_by_app and not workshop_updates and self._free_games_manual_only_when_no_news():
+        if (
+            want_game
+            and free_game_items
+            and not updates_by_app
+            and not workshop_updates
+            and not failed_appids
+            and self._free_games_manual_only_when_no_news()
+        ):
             self._log_debug(
                 "manual",
                 "free games only path used",
@@ -1376,7 +1153,7 @@ class SteamUpdatePush(Star):
             )
             payload_batches = [("game", game_sections)] if game_sections else []
             query_text = datetime.now().strftime("%Y/%m/%d %H:%M")
-            mode = str(self._cfg("message_mode", "card")).lower()
+            mode = profile.mode if profile else str(self._cfg("message_mode", "card")).lower()
             results: list[bytes | str] = []
             for card_kind, sections in payload_batches:
                 latest_ts = max(
@@ -1404,7 +1181,7 @@ class SteamUpdatePush(Star):
             else:
                 notice = "\u6ca1\u6709\u627e\u5230\u5f53\u5929\u7684\u66f4\u65b0\u4fe1\u606f\uff0c\u4ee5\u4e0b\u662f\u6700\u8fd1\u4e00\u6b21\u7684\u66f4\u65b0\u5185\u5bb9"
             if want_game:
-                fetched_updates = await self._fetch_news_for_appids(
+                fetched_updates, failed_appids = await self._fetch_news_for_appids(
                     appids,
                     fetch_count,
                     only_today=False,
@@ -1432,7 +1209,7 @@ class SteamUpdatePush(Star):
                 max_days=max_days,
             )
 
-        if not updates_by_app and not workshop_updates:
+        if not updates_by_app and not workshop_updates and not failed_appids:
             self._log_warn(
                 "manual",
                 "no updates from all sources",
@@ -1445,9 +1222,21 @@ class SteamUpdatePush(Star):
             notice = ""
 
         payload_batches: list[tuple[str, list[AppSection]]] = []
-        if want_game and (updates_by_app or free_game_items):
+        if want_game and (updates_by_app or free_game_items or failed_appids):
             visible_appids = [appid for appid in appids if appid in updates_by_app]
-            game_sections = await self._build_sections(visible_appids, updates_by_app, umo) if visible_appids else []
+            llm_deadline = time.monotonic() + self._llm_round_timeout_sec()
+            game_sections = (
+                await self._build_sections(
+                    visible_appids,
+                    updates_by_app,
+                    umo,
+                    llm_deadline=llm_deadline,
+                )
+                if visible_appids
+                else []
+            )
+            if failed_appids:
+                game_sections.extend(await self._build_query_error_sections(failed_appids))
             merged_game_sections = self._merge_game_sections_with_free_games(
                 game_sections,
                 free_game_items,
@@ -1461,7 +1250,7 @@ class SteamUpdatePush(Star):
                 payload_batches.append(("workshop", workshop_sections))
 
         query_text = datetime.now().strftime("%Y/%m/%d %H:%M")
-        mode = str(self._cfg("message_mode", "card")).lower()
+        mode = profile.mode if profile else str(self._cfg("message_mode", "card")).lower()
         results: list[bytes | str] = []
         first_batch = True
         for card_kind, sections in payload_batches:
@@ -1497,7 +1286,6 @@ class SteamUpdatePush(Star):
 
         self._log_debug("manual", "done", trace=trace, mode=mode, payload_count=len(results))
         return results, None
-
 
 
     def _normalize_manual_commands(self, raw: Any, default_commands: list[str]) -> list[str]:
@@ -1622,12 +1410,71 @@ class SteamUpdatePush(Star):
     def _news_seen_state_key(appid: str) -> str:
         return f"news_seen:{appid}"
 
+    @classmethod
+    def _target_delivery_state_key(
+        cls,
+        target: NotifyTarget,
+        source: str,
+        item_id: str,
+    ) -> str:
+        return f"delivery:{cls._target_ref(target.umo)}:{source}:{item_id}"
+
+    def _query_error_notice_due(
+        self,
+        state: dict[str, str],
+        target: NotifyTarget,
+        appid: str,
+    ) -> bool:
+        key = self._target_delivery_state_key(target, "query_error", appid)
+        try:
+            last_notified = float(state.get(key, "0"))
+        except (TypeError, ValueError):
+            last_notified = 0
+        return time.time() - last_notified >= 6 * 60 * 60
+
+    def _target_news_seen_gids(
+        self,
+        state: dict[str, str],
+        target: NotifyTarget,
+        appid: str,
+        items: list[NewsItem],
+    ) -> set[str]:
+        key = self._target_delivery_state_key(target, "news", appid)
+        uncertain_key = self._target_delivery_state_key(
+            target,
+            "news_uncertain",
+            appid,
+        )
+        if key not in state:
+            legacy_seen = self._decode_news_seen_state(
+                state.get(self._news_seen_state_key(appid), "")
+            )
+            if not legacy_seen:
+                legacy_gid = str(state.get(appid, "")).strip()
+                boundary_idx = next(
+                    (idx for idx, item in enumerate(items) if item.gid == legacy_gid),
+                    -1,
+                )
+                if boundary_idx >= 0:
+                    legacy_seen = [item.gid for item in items[boundary_idx:]]
+                elif legacy_gid:
+                    legacy_seen = [legacy_gid]
+            state[key] = self._encode_seen_gids(legacy_seen)
+        return set(
+            self._decode_news_seen_state(state.get(key, ""))
+            + self._decode_news_seen_state(state.get(uncertain_key, ""))
+        )
+
     def _news_seen_state_limit(self) -> int:
         try:
             limit = int(self._cfg("news_seen_state_limit", 120))
         except Exception:
             limit = 120
         return max(20, min(limit, 500))
+
+    def _encode_seen_gids(self, gids: list[str]) -> str:
+        unique_gids = list(dict.fromkeys(str(gid).strip() for gid in gids if str(gid).strip()))
+        return json.dumps(unique_gids[: self._news_seen_state_limit()], ensure_ascii=False)
 
     def _encode_news_seen_state(self, items: list[NewsItem]) -> str:
         gids: list[str] = []
@@ -1930,19 +1777,49 @@ class SteamUpdatePush(Star):
 
     async def _fetch_news(self, appid: str, count: int, only_today: bool = True) -> list[NewsItem]:
         if not self._client:
-            self._log_warn("fetch", "http client not ready", appid=appid)
-            return []
+            raise RuntimeError("Steam HTTP client is not ready")
 
-        api_items = await self._fetch_news_api(appid, count)
+        api_error: Exception | None = None
+        try:
+            api_items = await self._fetch_news_api(appid, count)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            api_error = exc
+            api_items = []
+            self._log_warn(
+                "fetch",
+                "Steam News API failed",
+                appid=appid,
+                error=self._exc_text(exc),
+            )
+
         source = "api"
         items = api_items
         if not items and self._enable_feed_fallback():
-            self._log_debug("fetch", "api empty, fallback to feed", appid=appid)
-            items = await self._fetch_news_feed(appid, count)
-            source = "feed"
+            self._log_debug("fetch", "api empty or failed, fallback to feed", appid=appid)
+            try:
+                items = await self._fetch_news_feed(appid, count)
+                source = "feed"
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if api_error is not None:
+                    raise RuntimeError(
+                        f"Steam News API and feed both failed for AppID {appid}"
+                    ) from exc
+                self._log_warn(
+                    "fetch",
+                    "Steam feed fallback failed after an empty API response",
+                    appid=appid,
+                    error=self._exc_text(exc),
+                )
+                items = []
+        elif api_error is not None:
+            raise RuntimeError(f"Steam News API failed for AppID {appid}") from api_error
 
         if not items:
-            self._log_warn("fetch", "no news from api/feed", appid=appid, only_today=only_today)
+            self._log_debug("fetch", "query succeeded with no news", appid=appid, only_today=only_today)
             return []
 
         items = self._normalize_news_items(items)
@@ -2477,10 +2354,11 @@ class SteamUpdatePush(Star):
             image_url=preview_url,
         )
 
-    async def _fetch_workshop_news_items(self) -> list[NewsItem]:
+    async def _fetch_workshop_news_items(self, item_ids: list[str] | None = None) -> list[NewsItem]:
         if not self._workshop_enabled():
             return []
-        item_ids = self._normalize_workshop_item_ids(self._cfg("workshop_item_ids", []))
+        if item_ids is None:
+            item_ids = self._normalize_workshop_item_ids(self._cfg("workshop_item_ids", []))
         if not item_ids:
             return []
         details = await self._fetch_workshop_details(item_ids)
@@ -2615,18 +2493,36 @@ class SteamUpdatePush(Star):
             data = resp.json()
         except Exception as exc:
             self._log_warn("fetch_api", "request failed", appid=appid, error=self._exc_text(exc), has_key=has_key)
-            return []
+            raise
 
-        items = data.get("appnews", {}).get("newsitems", []) or []
+        if not isinstance(data, dict):
+            raise ValueError("Steam News API response is not an object")
+        appnews = data.get("appnews")
+        if not isinstance(appnews, dict):
+            raise ValueError("Steam News API response is missing appnews")
+        items = appnews.get("newsitems", []) or []
+        if not isinstance(items, list):
+            raise ValueError("Steam News API newsitems is not a list")
+
         results: list[NewsItem] = []
+        skipped_external = 0
         for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url", ""))
+            if self._is_external_news(
+                url,
+                bool(item.get("is_external_url", False)),
+            ):
+                skipped_external += 1
+                continue
             contents = str(item.get("contents", ""))
             image_candidates = self._extract_news_image_candidates(contents)
             results.append(
                 NewsItem(
                     gid=str(item.get("gid", "")),
                     title=str(item.get("title", "")),
-                    url=str(item.get("url", "")),
+                    url=url,
                     contents=contents,
                     date=int(item.get("date", 0)),
                     appid=str(appid),
@@ -2640,6 +2536,7 @@ class SteamUpdatePush(Star):
             appid=appid,
             status=resp.status_code,
             item_count=len(results),
+            skipped_external=skipped_external,
             has_key=has_key,
         )
         return results
@@ -2663,6 +2560,13 @@ class SteamUpdatePush(Star):
             return match.group(1)
         raw = f"{link}|{title}|{ts}"
         return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:20]
+
+    @staticmethod
+    def _is_external_news(url: str, is_external_url: bool = False) -> bool:
+        if is_external_url:
+            return True
+        path = urlparse(str(url or "")).path.lower().rstrip("/")
+        return "/news/externalpost/" in f"{path}/"
 
     @staticmethod
     def _parse_feed_pub_ts(pub_date: str) -> int:
@@ -2709,20 +2613,26 @@ class SteamUpdatePush(Star):
             body = resp.text
         except Exception as exc:
             self._log_warn("fetch_feed", "request failed", appid=appid, error=self._exc_text(exc))
-            return []
+            raise
 
         try:
             root = ET.fromstring(body)
         except Exception as exc:
             self._log_warn("fetch_feed", "xml parse failed", appid=appid, error=exc)
-            return []
+            raise
 
         items = root.findall(".//item")
         max_count = max(1, count)
         results: list[NewsItem] = []
-        for item in items[:max_count]:
+        skipped_external = 0
+        for item in items:
+            if len(results) >= max_count:
+                break
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
+            if self._is_external_news(link):
+                skipped_external += 1
+                continue
             pub_date = (item.findtext("pubDate") or "").strip()
             desc = (item.findtext("description") or "").strip()
             ts = self._parse_feed_pub_ts(pub_date)
@@ -2746,6 +2656,7 @@ class SteamUpdatePush(Star):
             appid=appid,
             status=resp.status_code,
             item_count=len(results),
+            skipped_external=skipped_external,
         )
         return results
 
@@ -2792,29 +2703,6 @@ class SteamUpdatePush(Star):
             appids.append(val)
         return appids
 
-
-    def _game_query_concurrency(self) -> int:
-        try:
-            value = int(self._cfg("game_query_concurrency", 4))
-        except Exception:
-            value = 4
-        return max(1, min(value, 8))
-
-
-    def _get_news_query_semaphore(self) -> asyncio.Semaphore:
-        limit = self._game_query_concurrency()
-        semaphore = getattr(self, "_news_query_semaphore", None)
-        semaphore_limit = getattr(self, "_news_query_semaphore_limit", None)
-        if (
-            semaphore is None
-            or semaphore_limit != limit
-        ):
-            semaphore = asyncio.Semaphore(limit)
-            self._news_query_semaphore = semaphore
-            self._news_query_semaphore_limit = limit
-        return semaphore
-
-
     async def _fetch_news_for_appids(
         self,
         appids: list[str],
@@ -2822,9 +2710,9 @@ class SteamUpdatePush(Star):
         *,
         only_today: bool,
         trace: str = "",
-    ) -> dict[str, list[NewsItem]]:
+    ) -> tuple[dict[str, list[NewsItem]], set[str]]:
         if not appids:
-            return {}
+            return {}, set()
 
         semaphore = self._get_news_query_semaphore()
 
@@ -2878,8 +2766,84 @@ class SteamUpdatePush(Star):
             error_count=error_count,
             only_today=only_today,
         )
-        return updates_by_app
+        failed_appids = {
+            appid
+            for appid, result in zip(appids, results)
+            if isinstance(result, BaseException)
+        }
+        return updates_by_app, failed_appids
 
+    def _appid_map_path(self) -> Path:
+        return self._data_dir / "appid_name_map.json"
+
+    def _bundled_appid_map_path(self) -> Path:
+        return Path(__file__).with_name("appid_map.json")
+
+    def _load_appid_name_map(self) -> dict[str, Any]:
+        if self._appid_name_map is not None:
+            return self._appid_name_map
+
+        bundled_map: dict[str, Any] = {}
+        bundled_path = self._bundled_appid_map_path()
+        if bundled_path.exists():
+            try:
+                data = json.loads(bundled_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    bundled_map = {str(key): value for key, value in data.items()}
+                else:
+                    self._debug("load bundled appid map failed: root is not an object")
+            except Exception as exc:
+                self._debug(f"load bundled appid map failed: {exc}")
+
+        cached_map: dict[str, Any] = {}
+        cache_path = self._appid_map_path()
+        if cache_path.exists():
+            try:
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    cached_map = {str(key): value for key, value in data.items()}
+                else:
+                    self._debug("load appid name cache failed: root is not an object")
+            except Exception as exc:
+                self._debug(f"load appid name cache failed: {exc}")
+
+        # Bundled/manual names take precedence; the data-dir file stores fetched names.
+        merged_map = dict(cached_map)
+        for appid, bundled_value in bundled_map.items():
+            cached_value = cached_map.get(appid)
+            if isinstance(bundled_value, dict) and isinstance(cached_value, dict):
+                merged_map[appid] = {**cached_value, **bundled_value}
+            else:
+                merged_map[appid] = bundled_value
+        self._appid_name_map = merged_map
+        return self._appid_name_map
+
+    def _save_appid_name_map(self) -> None:
+        if self._appid_name_map is None:
+            return
+        try:
+            path = self._appid_map_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(self._appid_name_map, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self._debug(f"save appid map failed: {exc}")
+
+    def _load_name_cache(self) -> dict[str, Any]:
+        if self._name_cache is not None:
+            return self._name_cache
+        if self._name_cache_path.exists():
+            try:
+                data = json.loads(self._name_cache_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._name_cache = {str(k): v for k, v in data.items()}
+                    return self._name_cache
+            except Exception as exc:
+                self._debug(f"load name cache failed: {exc}")
+        self._name_cache = {}
+        return self._name_cache
 
     def _get_name_cache_lock(self) -> asyncio.Lock:
         lock = getattr(self, "_name_cache_lock", None)
@@ -2888,11 +2852,9 @@ class SteamUpdatePush(Star):
             self._name_cache_lock = lock
         return lock
 
-
     @staticmethod
     def _app_name_fallback(appid: str) -> str:
         return f"AppID {appid}"
-
 
     @staticmethod
     def _name_cache_value(value: Any) -> str:
@@ -2901,7 +2863,6 @@ class SteamUpdatePush(Star):
         if isinstance(value, dict):
             return str(value.get("value") or "").strip()
         return ""
-
 
     def _get_negative_name_cache_value(self, value: Any) -> str | None:
         if not isinstance(value, dict) or value.get("status") != "retry_exhausted":
@@ -2914,7 +2875,6 @@ class SteamUpdatePush(Star):
             return self._name_cache_value(value) or None
         return None
 
-
     def _appdetails_retry_attempts(self) -> int:
         try:
             value = int(self._cfg("appdetails_retry_attempts", 3))
@@ -2922,11 +2882,9 @@ class SteamUpdatePush(Star):
             value = 3
         return max(1, min(value, 5))
 
-
     @staticmethod
     def _is_retryable_appdetails_status(status_code: int) -> bool:
         return status_code == 429 or status_code >= 500
-
 
     @classmethod
     def _is_retryable_appdetails_exception(cls, exc: Exception) -> bool:
@@ -2937,13 +2895,11 @@ class SteamUpdatePush(Star):
             return bool(response and cls._is_retryable_appdetails_status(response.status_code))
         return False
 
-
     async def _save_name_cache_value(self, cache_key: str, value: Any) -> None:
         cache = self._load_name_cache()
         async with self._get_name_cache_lock():
             cache[cache_key] = value
             self._save_name_cache()
-
 
     async def _query_app_name_by_lang(self, appid: str, lang: str) -> str:
         appid_map = self._load_appid_name_map()
@@ -3025,51 +2981,6 @@ class SteamUpdatePush(Star):
             },
         )
         return fallback
-
-
-    def _appid_map_path(self) -> Path:
-        return Path(__file__).with_name("appid_map.json")
-
-    def _load_appid_name_map(self) -> dict[str, Any]:
-        if self._appid_name_map is not None:
-            return self._appid_name_map
-        path = self._appid_map_path()
-        if path.exists():
-            try:
-                self._appid_name_map = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(self._appid_name_map, dict):
-                    return self._appid_name_map
-            except Exception as exc:
-                self._debug(f"load appid map failed: {exc}")
-        self._appid_name_map = {}
-        return self._appid_name_map
-
-    def _save_appid_name_map(self) -> None:
-        if self._appid_name_map is None:
-            return
-        try:
-            path = self._appid_map_path()
-            path.write_text(
-                json.dumps(self._appid_name_map, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except Exception as exc:
-            self._debug(f"save appid map failed: {exc}")
-
-    def _load_name_cache(self) -> dict[str, Any]:
-        if self._name_cache is not None:
-            return self._name_cache
-        if self._name_cache_path.exists():
-            try:
-                data = json.loads(self._name_cache_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self._name_cache = {str(k): v for k, v in data.items()}
-                    return self._name_cache
-            except Exception as exc:
-                self._debug(f"load name cache failed: {exc}")
-        self._name_cache = {}
-        return self._name_cache
-
 
     def _save_name_cache(self) -> None:
         if self._name_cache is None:
@@ -3210,22 +3121,158 @@ class SteamUpdatePush(Star):
             text = text.replace("{" + key + "}", value)
         return text
 
-    def _build_llm_input(self, app_name: str, appid: str, items: list[NewsItem]) -> str:
-        lines: list[str] = [f"游戏：{app_name}", f"AppID：{appid}", ""]
-        for item in items:
-            if item.title:
-                lines.append(f"标题：{item.title}")
-            if item.date:
-                lines.append(f"时间：{self._format_time(item.date)}")
-            content = self._format_news_text(item.contents)
-            if content:
-                lines.append(content)
-            if item.url:
-                lines.append(f"链接：{item.url}")
-            lines.append("")
-        return "\n".join(lines).strip()
+    def _build_llm_input(
+        self,
+        items: list[NewsItem],
+    ) -> tuple[str, list[str]]:
+        try:
+            max_chars = int(self._cfg("llm_input_max_chars", 8000))
+        except (TypeError, ValueError):
+            max_chars = 8000
+        max_chars = max(1000, min(max_chars, 20000))
+        records: list[list[str]] = []
+        ids: list[str] = []
+        used_ids: set[str] = set()
+        for index, item in enumerate(items, start=1):
+            stable_key = str(item.gid or "").strip() or (
+                f"{item.appid}|{item.title}|{item.date}|{item.url}"
+            )
+            item_id = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:16]
+            if item_id in used_ids:
+                item_id = f"{item_id}-{index}"
+            used_ids.add(item_id)
+            ids.append(item_id)
+            records.append(
+                [
+                    item_id,
+                    str(item.title or "").strip(),
+                    self._format_news_text(item.contents),
+                ]
+            )
 
-    async def _call_llm(self, prompt: str, umo: str | None) -> str | None:
+        serialized = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+        while len(serialized) > max_chars:
+            content_record = max(records, key=lambda record: len(record[2]), default=None)
+            if not content_record or not content_record[2]:
+                break
+            excess = len(serialized) - max_chars
+            keep_chars = max(0, len(content_record[2]) - excess - 1)
+            content_record[2] = (
+                content_record[2][:keep_chars].rstrip() + "…"
+                if keep_chars
+                else ""
+            )
+            serialized = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+        while len(serialized) > max_chars:
+            title_record = max(records, key=lambda record: len(record[1]), default=None)
+            if not title_record or not title_record[1]:
+                break
+            excess = len(serialized) - max_chars
+            keep_chars = max(0, len(title_record[1]) - excess - 1)
+            title_record[1] = title_record[1][:keep_chars].rstrip() + ("…" if keep_chars else "")
+            serialized = json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+        return serialized, ids
+
+    @staticmethod
+    def _llm_cache_key(provider_id: str, prompt: str, max_tokens: int) -> str:
+        payload = json.dumps(
+            {
+                "version": 2,
+                "provider_id": provider_id,
+                "max_tokens": max_tokens,
+                "prompt": prompt,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _load_llm_cache(self) -> dict[str, dict[str, Any]]:
+        if self._llm_cache is not None:
+            return self._llm_cache
+        cache: dict[str, dict[str, Any]] = {}
+        if self._llm_cache_path.exists():
+            try:
+                data = json.loads(self._llm_cache_path.read_text(encoding="utf-8"))
+                entries = (
+                    data.get("entries")
+                    if isinstance(data, dict) and data.get("version") == 2
+                    else None
+                )
+                if isinstance(entries, dict):
+                    now = time.time()
+                    for key, value in entries.items():
+                        if not isinstance(key, str) or not isinstance(value, dict):
+                            continue
+                        try:
+                            created_at = float(value.get("created_at", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        text = str(value.get("text", "")).strip()
+                        if text and 0 <= now - created_at <= 86400:
+                            cache[key] = {"created_at": created_at, "text": text}
+                    while len(cache) > 256:
+                        cache.pop(next(iter(cache)))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                self._log_warn(
+                    "llm_cache",
+                    "load failed; starting with an empty cache",
+                    error_type=type(exc).__name__,
+                )
+        self._llm_cache = cache
+        return cache
+
+    def _get_cached_llm_result(
+        self,
+        cache_key: str,
+        expected_ids: set[str],
+    ) -> str | None:
+        cache = self._load_llm_cache()
+        entry = cache.get(cache_key)
+        if entry is None:
+            return None
+        if time.time() - float(entry["created_at"]) > 86400:
+            cache.pop(cache_key, None)
+            return None
+        text = str(entry["text"])
+        parsed = self._parse_llm_news_batch(text, expected_ids)
+        if parsed is None or set(parsed) != expected_ids:
+            cache.pop(cache_key, None)
+            return None
+        cache.pop(cache_key)
+        cache[cache_key] = entry
+        return text
+
+    def _save_llm_cache_result(self, cache_key: str, text: str) -> None:
+        cache = self._load_llm_cache()
+        cache.pop(cache_key, None)
+        cache[cache_key] = {"created_at": time.time(), "text": text}
+        while len(cache) > 256:
+            cache.pop(next(iter(cache)))
+        temp_path = self._llm_cache_path.with_suffix(".tmp")
+        try:
+            temp_path.write_text(
+                json.dumps(
+                    {"version": 2, "entries": cache},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                encoding="utf-8",
+            )
+            temp_path.replace(self._llm_cache_path)
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
+            self._log_warn(
+                "llm_cache",
+                "save failed",
+                error_type=type(exc).__name__,
+            )
+
+    async def _call_llm(
+        self,
+        prompt: str,
+        umo: str | None,
+        expected_ids: set[str],
+    ) -> str | None:
         provider_id = await self._resolve_llm_provider_id(umo)
         if not provider_id:
             providers = self._list_llm_provider_ids()
@@ -3236,6 +3283,51 @@ class SteamUpdatePush(Star):
             return None
         max_chars = int(self._cfg("content_max_chars", 800))
         max_tokens = min(2048, max(256, max_chars * 2))
+        cache_key = self._llm_cache_key(provider_id, prompt, max_tokens)
+        cached_text = self._get_cached_llm_result(cache_key, expected_ids)
+        if cached_text:
+            self._log_debug("llm", "cache hit", provider_id=provider_id)
+            return cached_text
+        inflight = self._llm_inflight.get(cache_key)
+        if inflight is not None and not inflight.done():
+            return await asyncio.shield(inflight)
+        task = asyncio.create_task(
+            self._request_and_cache_llm(
+                cache_key,
+                provider_id,
+                prompt,
+                max_tokens,
+                expected_ids,
+            )
+        )
+        self._llm_inflight[cache_key] = task
+        return await asyncio.shield(task)
+
+    async def _request_and_cache_llm(
+        self,
+        cache_key: str,
+        provider_id: str,
+        prompt: str,
+        max_tokens: int,
+        expected_ids: set[str],
+    ) -> str | None:
+        task = asyncio.current_task()
+        try:
+            text = await self._request_llm(provider_id, prompt, max_tokens)
+            parsed = self._parse_llm_news_batch(text, expected_ids) if text else None
+            if parsed is not None and set(parsed) == expected_ids:
+                self._save_llm_cache_result(cache_key, text)
+            return text
+        finally:
+            if self._llm_inflight.get(cache_key) is task:
+                self._llm_inflight.pop(cache_key, None)
+
+    async def _request_llm(
+        self,
+        provider_id: str,
+        prompt: str,
+        max_tokens: int,
+    ) -> str | None:
         t0 = time.perf_counter()
         try:
             resp = await asyncio.wait_for(
@@ -3340,6 +3432,52 @@ class SteamUpdatePush(Star):
         return "", body
 
     @staticmethod
+    def _parse_llm_news_batch(
+        text: str,
+        expected_ids: set[str],
+    ) -> dict[str, tuple[str, str]] | None:
+        normalized = SteamUpdatePush._normalize_llm_news_response(text)
+        if not normalized:
+            return None
+        try:
+            payload = json.loads(normalized)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            return None
+
+        parsed: dict[str, tuple[str, str]] = {}
+        seen_ids: set[str] = set()
+        invalid_ids: set[str] = set()
+        for record in payload["items"]:
+            if not isinstance(record, dict):
+                continue
+            item_id = str(record.get("id", "")).strip()
+            if not item_id:
+                continue
+            if item_id not in expected_ids:
+                return None
+            if item_id in seen_ids:
+                invalid_ids.add(item_id)
+                parsed.pop(item_id, None)
+                continue
+            seen_ids.add(item_id)
+            title = record.get("title")
+            contents = record.get("content")
+            if not isinstance(title, str) or not isinstance(contents, str):
+                invalid_ids.add(item_id)
+                continue
+            title = title.strip()
+            contents = contents.strip()
+            if not title or not contents:
+                invalid_ids.add(item_id)
+                continue
+            parsed[item_id] = (title, contents)
+        for item_id in invalid_ids:
+            parsed.pop(item_id, None)
+        return parsed
+
+    @staticmethod
     def _title_contains_han_characters(title: str) -> bool:
         return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ebef\U0002ebf0-\U0002ee5f\U0002f800-\U0002fa1f\U00030000-\U000323af\U000323b0-\U0003347f]", title))
 
@@ -3357,27 +3495,86 @@ class SteamUpdatePush(Star):
             sections.append(AppSection(appid=appid, title=title, updates=updates))
         return sections
 
+    async def _build_query_error_sections(self, appids: set[str]) -> list[AppSection]:
+        ordered_appids = sorted(appids, key=lambda value: value)
+        names = await self._resolve_app_names(ordered_appids)
+        return [
+            AppSection(
+                appid=appid,
+                title=names.get(appid) or f"AppID {appid}",
+                updates=[],
+                query_error="Steam 查询失败，暂时无法获取公告",
+            )
+            for appid in ordered_appids
+        ]
+
     async def _build_sections_llm(
         self,
         appids: list[str],
         updates_by_app: dict[str, list[NewsItem]],
         umo: str | None,
+        llm_deadline: float | None = None,
     ) -> list[AppSection] | None:
         names = await self._resolve_app_names(appids)
         template = str(self._cfg("llm_prompt", "")).strip()
         if not template:
             self._debug("llm prompt empty, skip")
             return None
-        max_chars = int(self._cfg("content_max_chars", 800))
+        try:
+            max_chars = int(self._cfg("content_max_chars", 800))
+        except (TypeError, ValueError):
+            max_chars = 800
+        max_chars = max(1, max_chars)
+        deadline = (
+            llm_deadline
+            if llm_deadline is not None
+            else time.monotonic() + self._llm_round_timeout_sec()
+        )
         sections: list[AppSection] = []
+        budget_exhausted = False
         for appid in appids:
             items = updates_by_app.get(appid, [])
             title = names.get(appid) or f"AppID {appid}"
             if not items:
                 sections.append(AppSection(appid=appid, title=title, updates=[]))
                 continue
-            source_title = items[0].title or "更新内容"
-            raw_input = self._build_llm_input(title, appid, items)
+            if budget_exhausted:
+                sections.append(
+                    AppSection(
+                        appid=appid,
+                        title=title,
+                        updates=[
+                            replace(
+                                item,
+                                llm_notice="本轮 LLM 时间预算已耗尽，以下为原文",
+                            )
+                            for item in items
+                        ],
+                    )
+                )
+                continue
+
+            raw_input, item_ids = self._build_llm_input(items)
+            try:
+                input_max_chars = int(self._cfg("llm_input_max_chars", 8000))
+            except (TypeError, ValueError):
+                input_max_chars = 8000
+            input_max_chars = max(1000, min(input_max_chars, 20000))
+            if len(raw_input) > input_max_chars:
+                sections.append(
+                    AppSection(
+                        appid=appid,
+                        title=title,
+                        updates=[
+                            replace(
+                                item,
+                                llm_notice="公告批次超出 LLM 输入限制，以下为原文",
+                            )
+                            for item in items
+                        ],
+                    )
+                )
+                continue
             prompt = self._apply_prompt_template(
                 template,
                 {
@@ -3390,52 +3587,114 @@ class SteamUpdatePush(Star):
             )
             prompt = (
                 f"{prompt.rstrip()}\n\n"
-                "【输出格式】\n"
-                "严格按以下结构输出，不要输出其他内容：\n"
-                "【标题】\n"
-                "单个返回标题必须为“第一条公告原标题”的简体中文译文\n"
-                f"第一条公告原标题：{source_title}\n"
-                "标题必须使用简体中文\n"
-                "【正文】\n"
-                "正文继续遵循前述提示词的语言与格式要求\n"
-                "原标题含有汉字时，标题必须逐字保留原标题。"
+                "请忽略上方模板中与输出格式冲突的要求。输入是 JSON 数组，每条按 [公告 id, 原标题, 原正文] 排列。\n"
+                "必须逐条处理并保留所有 id，不得合并、遗漏或新增公告。只整理/翻译 title 和 content，"
+                "不要输出时间、链接或游戏名称。若原标题含有汉字，title 必须逐字保留原标题；"
+                "其他标题翻译成简体中文。content 遵循前述语言要求。\n"
+                "严格只输出以下 JSON，不要 Markdown 围栏或额外文字：\n"
+                '{"items":[{"id":"原 id","title":"处理后的标题","content":"处理后的正文"}]}'
             )
-            llm_text = await self._call_llm(prompt, umo)
-            if not llm_text:
-                sections.append(AppSection(appid=appid, title=title, updates=items))
-                continue
-            parsed_response = self._parse_llm_news_response(llm_text)
-            if parsed_response is not None:
-                parsed_title, parsed_contents = parsed_response
-                merged_title = (
-                    source_title
-                    if parsed_title and self._title_contains_han_characters(source_title)
-                    else parsed_title
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                budget_exhausted = True
+                sections.append(
+                    AppSection(
+                        appid=appid,
+                        title=title,
+                        updates=[
+                            replace(
+                                item,
+                                llm_notice="本轮 LLM 时间预算已耗尽，以下为原文",
+                            )
+                            for item in items
+                        ],
+                    )
                 )
-                merged_contents = parsed_contents
-            else:
-                merged_title = ""
-                merged_contents = llm_text
-                if any(self._llm_protocol_marker_present(line) for line in self._normalize_llm_news_response(llm_text).split("\n")):
-                    merged_contents = self._sanitize_llm_protocol_lines(llm_text)
-            latest_ts = max((it.date for it in items if it.date), default=items[0].date)
-            image_candidates: list[str] = []
-            for item in items:
-                for url in self._item_image_candidates(item):
-                    if url not in image_candidates:
-                        image_candidates.append(url)
-            image_url = image_candidates[0] if image_candidates else ""
-            merged = NewsItem(
-                gid=items[0].gid,
-                title=merged_title,
-                url=items[0].url,
-                contents=merged_contents,
-                date=latest_ts,
-                appid=items[0].appid,
-                image_url=image_url,
-                image_candidates=tuple(image_candidates),
-            )
-            sections.append(AppSection(appid=appid, title=title, updates=[merged]))
+                continue
+            try:
+                llm_text = await asyncio.wait_for(
+                    self._call_llm(prompt, umo, set(item_ids)),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                llm_text = None
+                budget_exhausted = True
+                self._log_warn(
+                    "llm",
+                    "round time budget exhausted",
+                    appid=appid,
+                    timeout_sec=self._llm_round_timeout_sec(),
+                )
+            except Exception as exc:
+                llm_text = None
+                self._log_warn(
+                    "llm",
+                    "unexpected processing failure; preserving original announcements",
+                    appid=appid,
+                    error_type=type(exc).__name__,
+                )
+            if not llm_text:
+                self._log_warn(
+                    "llm",
+                    "using original news after processing failure",
+                    appid=appid,
+                )
+                sections.append(
+                    AppSection(
+                        appid=appid,
+                        title=title,
+                        updates=[
+                            replace(
+                                item,
+                                llm_notice=(
+                                    "本轮 LLM 时间预算已耗尽，以下为原文"
+                                    if budget_exhausted
+                                    else "LLM 请求失败或超时，以下为原文"
+                                ),
+                            )
+                            for item in items
+                        ],
+                    )
+                )
+                continue
+            parsed_items = self._parse_llm_news_batch(llm_text, set(item_ids))
+            batch_format_error = parsed_items is None
+            if parsed_items is None:
+                parsed_items = {}
+            processed: list[NewsItem] = []
+            for item, item_id in zip(items, item_ids):
+                parsed_item = parsed_items.get(item_id)
+                if parsed_item is None:
+                    processed.append(
+                        replace(
+                            item,
+                            llm_notice=(
+                                "LLM 返回格式异常，以下为原文"
+                                if batch_format_error
+                                else "LLM 未返回该公告的有效结果，以下为原文"
+                            ),
+                        )
+                    )
+                    continue
+                translated_title, translated_contents = parsed_item
+                if self._title_contains_han_characters(item.title):
+                    translated_title = item.title
+                elif not self._title_contains_han_characters(translated_title):
+                    processed.append(
+                        replace(
+                            item,
+                            llm_notice="LLM 标题翻译异常，以下为原文",
+                        )
+                    )
+                    continue
+                processed.append(
+                    replace(
+                        item,
+                        title=translated_title,
+                        contents=translated_contents,
+                    )
+                )
+            sections.append(AppSection(appid=appid, title=title, updates=processed))
         return sections
 
     async def _build_sections(
@@ -3443,10 +3702,16 @@ class SteamUpdatePush(Star):
         appids: list[str],
         updates_by_app: dict[str, list[NewsItem]],
         umo: str | None = None,
+        llm_deadline: float | None = None,
     ) -> list[AppSection]:
         mode = str(self._cfg("content_process_mode", "plugin")).lower().strip()
         if mode == "llm":
-            sections = await self._build_sections_llm(appids, updates_by_app, umo)
+            sections = await self._build_sections_llm(
+                appids,
+                updates_by_app,
+                umo,
+                llm_deadline,
+            )
             if sections is not None:
                 return sections
             self._debug("llm failed, fallback to plugin mode")
@@ -3466,13 +3731,17 @@ class SteamUpdatePush(Star):
         for sec in sections:
             is_free_games_sec = str(sec.appid).strip().lower() == "free_games"
             lines.append(f"【{sec.title}】")
+            if sec.llm_fallback:
+                lines.append("（LLM 处理失败，以下为原文）")
             if not sec.updates:
-                lines.append("暂无更新")
+                lines.append(sec.query_error or "暂无更新")
                 lines.append("")
                 continue
             for item in sec.updates:
                 if item.title:
                     lines.append(f"- {item.title}")
+                if item.llm_notice:
+                    lines.append(f"（{item.llm_notice}）")
                 if is_free_games_sec:
                     summary = self._summarize_free_game_text(item.contents, max_chars)
                 else:
@@ -3813,8 +4082,26 @@ class SteamUpdatePush(Star):
         if not is_workshop_sec:
             game_name = str(sec.title or "").strip().strip("[]").strip("\u3010\u3011")
             blocks.append(RenderBlock("text", game_name, section_title_font, accent, 14))
+            if sec.llm_fallback:
+                blocks.append(
+                    RenderBlock(
+                        "text",
+                        "LLM 处理失败，以下为原文",
+                        small_font,
+                        (230, 176, 70),
+                        12,
+                    )
+                )
         if not sec.updates:
-            blocks.append(RenderBlock("text", "暂无更新", body_font, muted, 16))
+            blocks.append(
+                RenderBlock(
+                    "text",
+                    sec.query_error or "暂无更新",
+                    body_font,
+                    (230, 176, 70) if sec.query_error else muted,
+                    16,
+                )
+            )
             header_img = header_map.get(sec.appid)
             if header_img:
                 header_img = self._scale_image(header_img, image_max_width, max_img_h)
@@ -3842,6 +4129,15 @@ class SteamUpdatePush(Star):
                     if title_blocks:
                         title_blocks[-1].gap = 8
                         blocks.extend(title_blocks)
+            if item.llm_notice:
+                blocks.extend(
+                    self._wrap_blocks(
+                        item.llm_notice,
+                        small_font,
+                        (230, 176, 70),
+                        max_text_width,
+                    )
+                )
             if is_free_games_sec:
                 summary = self._summarize_free_game_text(item.contents, max_chars)
             else:
@@ -4544,6 +4840,7 @@ class SteamUpdatePush(Star):
                 self._log_warn("push", "target failed", **fields)
         return PushResult(succeeded, failed, uncertain)
 
+
     @staticmethod
     def _send_receipt_uncertain(exc: Exception) -> bool:
         if isinstance(exc, TimeoutError):
@@ -4559,6 +4856,7 @@ class SteamUpdatePush(Star):
             if isinstance((value := result.get(key)), str)
         ).lower()
         return "timeout" in detail and "nodeikernelmsgservice/sendmsg" in detail
+
 
     async def _send_to_target(
         self,
@@ -4633,6 +4931,7 @@ class SteamUpdatePush(Star):
             )
             return False
 
+
     def _save_temp_image(self, image_bytes: bytes) -> str | None:
         if not image_bytes:
             return None
@@ -4699,6 +4998,18 @@ class SteamUpdatePush(Star):
             pass
         text = "".join(parts).strip()
         return text
+
+    @filter.command("STEAM订阅", alias={"steam_sub"})
+    async def steam_subscriptions(self, event: AstrMessageEvent, args: GreedyStr):
+        """查看或管理当前会话的 Steam 订阅。"""
+        yield event.plain_result(await self._subscription_command(event, args))
+        event.stop_event()
+
+    @filter.command("STEAM全局订阅", alias={"steam_sub_global"})
+    async def steam_global_subscriptions(self, event: AstrMessageEvent, args: GreedyStr):
+        """AstrBot 管理员通过完整 UMO 管理指定会话。"""
+        yield event.plain_result(await self._subscription_command(event, args, global_scope=True))
+        event.stop_event()
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def steam_updates_on_group_message(self, event: AstrMessageEvent):
@@ -4819,4 +5130,6 @@ class SteamUpdatePush(Star):
 
 
 class Main(SteamUpdatePush):
-    pass
+    async def terminate(self):
+        # AstrBot checks the registered class's own methods during reload.
+        await super().terminate()

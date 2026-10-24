@@ -1,6 +1,104 @@
 # 更新日志
 
-本文档记录 `astrbot_plugin_steam_updates` 的版本变更。
+## v1.3.7-local.2
+
+- 合入基于完整 UMO 的分会话订阅；保留本地字体、轮询生命周期修复、发送回执分类和共享名称查询取消隔离
+- 上游逐条公告 JSON 协议、按目标状态、外部新闻过滤与 LLM 缓存一并整合
+- 热重载时等待名称与 LLM 共享任务退出后再关闭 HTTP 客户端
+
+本文档记录 `astrbot_plugin_steam_updates` 的版本变更
+
+## 未发布
+
+### 新增
+- 基于完整 UMO 的分会话订阅：独立游戏、创意工坊、免费领取与图片/文字模式，使用 AstrBot 原生卡片式配置列表
+- 新增 STEAM订阅 与 STEAM全局订阅 命令，分别管理当前会话和管理员指定会话；普通成员只读，本群群主/管理员可管理本群
+- 兼容旧全局目标与订阅，独立空规则和暂停不会回落全局配置；新增来源成功抓取后建立初始基线
+
+### 调整
+- 每轮按订阅并集抓取，同内容同模式复用处理和渲染；三类来源均按目标分别记录成功、失败及结果不确定的投递状态
+- 手动查询按当前会话订阅筛选；发送前重新校验订阅，避免退订后发送过期快照
+- 状态原子写入、迁移前保留备份；状态持久化失败时中止发送，避免迁移丢失后重复推送
+- 在注册的 Main 类显式转发 terminate，确保配置重载时 AstrBot 可以调用现有资源清理逻辑
+
+## v1.3.7
+
+### 修复
+- 卡片图片发送结果不确定时不再立即补发重复文字；按目标记录结果未知的游戏新闻并抑制自动重试，优先避免重复推送
+- 卡片在发送前生成或构造失败时仍回退为文字
+- LLM 请求失败时明确标注原文回退，避免英文原文被误认为已翻译
+- LLM 模式改为按公告 ID 逐条整理标题和正文，不再将同一游戏的多条公告合并；原公告时间、链接、图片和 GID 保持不变
+- LLM 输出按 ID、重复项和缺失项校验，异常公告独立回退原文并标注；只有整批结果完整有效时才写入新协议缓存
+- 增加每轮 LLM 总时间预算，预算耗尽后剩余公告直接使用原文并标注，不再继续调用模型
+- 区分 Steam 查询失败与查询成功但无更新；失败 AppID 显示明确占位，自动推送按目标 6 小时冷却，后续轮询仍会重试
+
+### 优化
+- 在 `support_platforms` 中声明 `discord`、`telegram`、`qq_official` 和 `satori`，与现有 `aiocqhttp` 一起支持 AstrBot 通用会话消息路径
+- 新增成功 LLM 结果缓存（插件数据目录内，最长保留 24 小时、最多 256 条），相同提供商与提示词输入可复用结果；失败或格式无效的结果不缓存
+- 合并进行中的相同 LLM 请求，避免并发查询对相同内容重复调用模型
+- 精简 LLM 输入，省略发布时间、链接等元数据，并通过 `llm_input_max_chars` 限制每个游戏的输入长度（默认 8000，范围 1000-20000）
+- 保持 LLM 请求串行与 30 秒超时上限，避免通过提高并发或重试增加模型侧瞬时负载
+- 新增 `llm_round_timeout_sec`（默认 90 秒，范围 30-300）控制单轮 LLM 总处理时间
+
+## v1.3.6
+
+### 变更
+
+- 现在插件首次查询并成功获取名称后，会将映射保存到插件数据目录中的 `appid_name_map.json`
+- 从旧版本覆盖升级时，插件目录中的 `appid_map.json` 可能被新版文件替换，如果其中包含自定义映射或运行时缓存，请在升级前备份
+- 新版不会自动迁移旧文件中的映射，缺失的名称会在后续查询时重新联网获取并保存
+
+## v1.3.5
+
+### 修复
+- 游戏新闻查询排除已标记的外部文章；API 使用 `is_external_url` 字段，Feed 使用 `externalpost` 链接路径识别
+- 游戏新闻去重状态改为按推送目标分别记录，已送达目标不因其他目标发送失败而重复收到同一批新闻；失败目标会在后续轮询重试
+- LLM 请求超时调整为默认及最大 30 秒（可配置范围 5-30 秒），超时后回退到插件内置处理，降低单轮轮询被模型请求长时间阻塞的风险
+
+<details>
+<summary>历史版本（点击展开）</summary>
+
+## v1.3.4
+
+### 修复
+- AppID 名称查询增加可配置的暂时性网络错误重试，降低 TLS 中断或代理抖动导致显示裸 AppID 的概率
+- 增加带 TTL 的失败负缓存，并合并同一 AppID/语言的进行中查询，避免短时间内重复请求
+- 保持人工 `appid_map.json` 映射优先，失败占位不会写入人工映射
+
+## v1.3.3
+
+### 变更
+- 优化游戏新闻查询为并发模式，加快查询速度
+- 新增 `game_query_concurrency` 配置（轮询和手动查询共享并发上限）
+- AppID 查询保持配置顺序并去重，单个查询失败不会影响其他游戏
+
+## v1.3.2
+
+### 变更
+- 更新 `README.md` 说明
+- 优化插件
+
+## v1.3.1
+
+### 变更
+- 更换专用字体文件以符合 AstrBot 插件大小限制
+- 字体基于 `Source Han Sans CN Regular` 和 `Source Han Sans CN Bold, Version 2.005` 构建为 `SteamUpdatesCJK` 子集字体，并保留插件所需的中文、拉丁字符、CJK 标点、全角字符和日文假名
+- 由于 `Source` 是上游许可证中的保留字体名称，衍生字体重命名为 `SteamUpdatesCJK`
+- 字体来源与构建说明见 `font/FONT-NOTICE.txt`，完整字体许可证见 `font/OFL-1.1.txt`
+- README 新增内置字体来源、构建方式和独立许可说明
+
+## v1.3.0
+
+[PR#7](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pull/7) by [Rhonin Wang](https://github.com/RhoninSeiei)
+### 新增
+- Steam 游戏公告支持按正文顺序提取图片候选并展示首张有效图片，失败时继续尝试后续候选并回退游戏头图
+- 公告图片保持原始比例，不裁剪、不拉伸；窄图保持原始尺寸并水平居中，卡片高度按实际图片动态扩展
+- LLM 内容处理支持在同一次请求中同时翻译公告标题并整理正文，不增加额外模型请求
+
+### 修复
+- 兼容 GamerPower 在没有有效免费活动时返回字典响应，避免将正常空结果误判为抓取异常
+- LLM 响应兼容空行、Markdown 围栏、同行或重复协议标记以及全角/半角冒号
+- 无有效中文标题时省略公告标题并保留正文，防止 `【标题】`、`【正文】` 等协议标记进入卡片或文本
 
 ## v1.3.4-local.1
 
@@ -51,22 +149,19 @@
 
 ## v1.2.8
 
+[PR#4](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pull/4) by [Rhonin Wang](https://github.com/RhoninSeiei)
 ### 优化
 - 优化游戏更新推送卡片的可读性与准确性
-[PR#4](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pull/4) by [Rhonin Wang](https://github.com/RhoninSeiei)
 
 ### 变更
 - 轮询推送时仅包含本周期内有更新的 AppID
 - 游戏更新卡片补充“公告/新闻标题”
 
-<details>
-<summary>历史版本（点击展开）</summary>
-
 ## v1.2.7
 
+[issues#2](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/issues/2);[PR#3](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pull/3) by [Rhonin Wang](https://github.com/RhoninSeiei)
 ### 修复
 - 添加去重机制，防止同一更新多次推送
-[issues#2](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/issues/2);[PR#3](https://github.com/DearCrazyLeaf/astrbot_plugin_steam_updates/pull/3) by [Rhonin Wang](https://github.com/RhoninSeiei)
 
 ## v1.2.6
 
