@@ -662,6 +662,24 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 raise
 
             mode = self._proxy_mode()
+            if (
+                mode == "custom"
+                and method.upper() in {"GET", "HEAD"}
+                and isinstance(exc, httpx.ReadTimeout)
+            ):
+                # A slow response does not prove the proxy route is unusable.
+                # Retry safe reads once before switching to direct connectivity.
+                self._log_warn(
+                    "network", "proxy read timed out, retrying same proxy once",
+                    method=method.upper(), mode=mode,
+                )
+                await asyncio.sleep(0.5)
+                try:
+                    return await self._client.request(method, url, **kwargs)
+                except Exception as retry_exc:
+                    if not self._is_retryable_network_error(retry_exc):
+                        raise
+                    exc = retry_exc
             fallback_kind = ""
             fallback_kwargs: dict[str, Any] = {"trust_env": False}
             if mode == "custom":
