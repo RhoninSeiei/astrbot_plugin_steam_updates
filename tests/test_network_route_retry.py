@@ -50,10 +50,45 @@ class NetworkRouteRetryTest(unittest.IsolatedAsyncioTestCase):
     async def test_exhausted_proxy_retry_uses_direct_once(self):
         self.request.side_effect = httpx.ReadTimeout('slow')
         self.assertIs(await self.invoke(), self.response)
-        self.assertEqual(self.request.await_count, 2)
+        self.assertEqual(self.request.await_count, 4)
         self.assertEqual(self.fallback_request.await_count, 1)
         self.assertFalse(self.fallback.call_args.kwargs['trust_env'])
         self.assertNotIn('proxy', self.fallback.call_args.kwargs)
+
+    async def test_default_can_recover_on_third_proxy_retry(self):
+        self.request.side_effect = [httpx.ReadTimeout('slow')] * 3 + [self.response]
+        self.assertIs(await self.invoke(), self.response)
+        self.assertEqual(self.request.await_count, 4)
+        self.fallback.assert_not_called()
+
+    async def test_configured_retry_budget_including_zero(self):
+        for retries in (0, 1, 2, 5):
+            with self.subTest(retries=retries):
+                self.p.config['proxy_read_timeout_retries'] = retries
+                self.request.reset_mock()
+                self.fallback_request.reset_mock()
+                self.request.side_effect = httpx.ReadTimeout('slow')
+                self.assertIs(await self.invoke(), self.response)
+                self.assertEqual(self.request.await_count, 1 + retries)
+                self.assertEqual(self.fallback_request.await_count, 1)
+
+    async def test_grouped_webui_retry_setting_is_used(self):
+        self.p.config = {'network_proxy': {'proxy_mode':'custom', 'proxy_url':'http://proxy.test:7890', 'proxy_read_timeout_retries':2}}
+        self.request.side_effect = httpx.ReadTimeout('slow')
+        await self.invoke()
+        self.assertEqual(self.request.await_count, 3)
+
+    async def test_connection_error_during_retry_stops_proxy_retries(self):
+        self.request.side_effect = [httpx.ReadTimeout('slow'), httpx.ConnectError('unavailable')]
+        self.assertIs(await self.invoke(), self.response)
+        self.assertEqual(self.request.await_count, 2)
+        self.assertEqual(self.fallback_request.await_count, 1)
+
+    def test_retry_budget_defaults_and_clamps_invalid_config(self):
+        for raw, expected in [(None,3), ('invalid',3), (-1,0), (99,5), ('2',2), (float('inf'),3)]:
+            with self.subTest(raw=raw):
+                self.p.config['proxy_read_timeout_retries'] = raw
+                self.assertEqual(self.p._proxy_read_timeout_retries(), expected)
 
     async def test_connection_failure_falls_back_without_proxy_retry(self):
         self.request.side_effect = httpx.ConnectError('unavailable')

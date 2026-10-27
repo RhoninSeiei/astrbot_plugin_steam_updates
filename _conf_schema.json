@@ -342,6 +342,12 @@
         "type": "string",
         "default": "",
         "hint": "示例：http://127.0.0.1:7890 或 socks5://127.0.0.1:7890（仅 proxy_mode=custom 生效）"
+      },
+      "proxy_read_timeout_retries": {
+        "description": "代理读取超时重试次数",
+        "type": "int",
+        "default": 3,
+        "hint": "范围 0-5，默认 3；不包含首次请求。0 表示关闭同代理重试。仅自定义代理的 GET、HEAD 读取超时生效，耗尽后尝试直连。"
       }
     }
   },

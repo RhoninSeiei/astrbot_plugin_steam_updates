@@ -573,6 +573,13 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
     def _proxy_url(self) -> str:
         return str(self._cfg("proxy_url", "")).strip()
 
+    def _proxy_read_timeout_retries(self) -> int:
+        try:
+            value = int(self._cfg("proxy_read_timeout_retries", 3))
+        except (TypeError, ValueError, OverflowError):
+            value = 3
+        return max(0, min(value, 5))
+
     @staticmethod
     def _mask_proxy_url(url: str) -> str:
         if not url:
@@ -668,18 +675,24 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 and isinstance(exc, httpx.ReadTimeout)
             ):
                 # A slow response does not prove the proxy route is unusable.
-                # Retry safe reads once before switching to direct connectivity.
-                self._log_warn(
-                    "network", "proxy read timed out, retrying same proxy once",
-                    method=method.upper(), mode=mode,
-                )
-                await asyncio.sleep(0.5)
-                try:
-                    return await self._client.request(method, url, **kwargs)
-                except Exception as retry_exc:
-                    if not self._is_retryable_network_error(retry_exc):
-                        raise
-                    exc = retry_exc
+                # Retry safe reads within the configured budget before switching
+                # routes. Connection failures stop same-proxy retries early.
+                retries = self._proxy_read_timeout_retries()
+                for attempt in range(1, retries + 1):
+                    self._log_warn(
+                        "network", "proxy read timed out, retrying same proxy",
+                        method=method.upper(), mode=mode,
+                        retry=attempt, max_retries=retries,
+                    )
+                    await asyncio.sleep(0.5)
+                    try:
+                        return await self._client.request(method, url, **kwargs)
+                    except Exception as retry_exc:
+                        if not self._is_retryable_network_error(retry_exc):
+                            raise
+                        exc = retry_exc
+                        if not isinstance(retry_exc, httpx.ReadTimeout):
+                            break
             fallback_kind = ""
             fallback_kwargs: dict[str, Any] = {"trust_env": False}
             if mode == "custom":

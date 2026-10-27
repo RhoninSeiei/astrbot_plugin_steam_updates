@@ -69,7 +69,7 @@
 
 ## 本地维护版
 
-当前版本为 `v1.3.7-local.4`，增加自定义代理读取超时后的一次同代理重试，保留官方公告过滤修复、分会话订阅及本地可靠性改动。
+当前版本为 `v1.3.7-local.5`，自定义代理读取超时后默认重试 3 次，可在网络与代理设置中调整；保留官方公告过滤修复、分会话订阅及本地可靠性改动。
 
 本地继续使用 `font/YaHei.ttf` 和 `font/YaHei-Bold.ttc`，未替换为上游精简字体。字体资产不包含在独立上游订阅 PR 中。
 
@@ -106,6 +106,7 @@ AstrBot WebUI -> 插件 -> 插件配置
 | display_timezone | 免费领取截止时间显示时区；留空跟随容器系统时区，填写 IANA 时区名时按 UTC 活动源时间转换显示 |
 | proxy_mode | 代理模式：`off` / `system` / `custom` |
 | proxy_url | 自定义代理地址（仅 `custom` 生效） |
+| proxy_read_timeout_retries | 同代理读取超时重试次数，默认 `3`，范围 `0-5`，不包含首次请求；`0` 关闭同代理重试 |
 | steam_appids | AppID 列表（如 `730`） |
 | workshop_enable | 是否启用创意工坊订阅监控 |
 | workshop_item_ids | 创意工坊订阅ID列表（PublishedFileID） |
