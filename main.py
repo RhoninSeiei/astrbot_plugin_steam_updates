@@ -137,6 +137,8 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
 
         self._client: httpx.AsyncClient | None = None
         self._client_signature: str = ""
+        self._http_client_users: dict[int, int] = {}
+        self._retired_http_clients: dict[int, httpx.AsyncClient] = {}
         self._news_query_semaphore: asyncio.Semaphore | None = None
         self._news_query_semaphore_limit: int | None = None
         self._poll_task: asyncio.Task | None = None
@@ -188,8 +190,12 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
             await asyncio.gather(*tasks, return_exceptions=True)
         inflight.clear()
         llm_inflight.clear()
+        clients = {id(c): c for c in getattr(self, "_retired_http_clients", {}).values()}
         if self._client:
-            await self._client.aclose()
+            clients[id(self._client)] = self._client
+        for client in clients.values():
+            await client.aclose()
+        getattr(self, "_retired_http_clients", {}).clear()
         self._client = None
         self._client_signature = ""
 
@@ -635,6 +641,9 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         return f"{self._proxy_mode()}|{self._proxy_url()}"
 
     async def _ensure_http_client(self) -> None:
+        stop = getattr(self, "_stop_event", None)
+        if stop is not None and stop.is_set():
+            raise RuntimeError("Steam HTTP client is stopped")
         signature = self._http_client_signature()
         if self._client is not None and self._client_signature == signature:
             return
@@ -642,10 +651,49 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         self._client = self._build_http_client()
         self._client_signature = signature
         if old_client is not None:
-            try:
-                await old_client.aclose()
-            except Exception:
-                pass
+            await self._retire_http_client(old_client)
+
+    async def _retire_http_client(self, client) -> None:
+        if not hasattr(self, "_retired_http_clients"):
+            self._retired_http_clients = {}
+        self._retired_http_clients[id(client)] = client
+        if not getattr(self, "_http_client_users", {}).get(id(client), 0):
+            await self._close_retired_http_client(client)
+
+    async def _close_retired_http_client(self, client) -> None:
+        try:
+            await client.aclose()
+        except Exception as exc:
+            self._log_warn("network", "retired client close failed", error_type=type(exc).__name__)
+            return  # Keep it for termination cleanup.
+        self._retired_http_clients.pop(id(client), None)
+
+    async def _call_http_client(self, client, operation: str, *args, **kwargs):
+        if not hasattr(self, "_http_client_users"):
+            self._http_client_users = {}
+        users = self._http_client_users
+        key = id(client)
+        users[key] = users.get(key, 0) + 1
+        try:
+            return await getattr(client, operation)(*args, **kwargs)
+        finally:
+            users[key] -= 1
+            if not users[key]:
+                users.pop(key)
+                if key in getattr(self, "_retired_http_clients", {}):
+                    await self._close_retired_http_client(client)
+
+    async def _recover_http_client_pool(self, failed_client):
+        # Publish the replacement before awaiting cleanup. Concurrent failures
+        # from the old generation share one replacement, without closing peers.
+        if self._stop_event.is_set():
+            raise RuntimeError("Steam HTTP client is stopped")
+        if self._client is failed_client:
+            self._client = self._build_http_client()
+            self._client_signature = self._http_client_signature()
+            self._log_warn("network", "connection pool exhausted, replacing HTTP client")
+            await self._retire_http_client(failed_client)
+        return self._client
 
     @staticmethod
     def _exc_text(exc: Exception | None) -> str:
@@ -662,11 +710,21 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         if self._client is None:
             raise RuntimeError("http client not ready")
 
+        client = self._client
         try:
-            return await self._client.request(method, url, **kwargs)
+            return await self._call_http_client(client, "request", method, url, **kwargs)
         except Exception as exc:
             if not isinstance(exc, Exception) or not self._is_retryable_network_error(exc):
                 raise
+
+            if isinstance(exc, httpx.PoolTimeout) and method.upper() in {"GET", "HEAD"}:
+                recovered_client = await self._recover_http_client_pool(client)
+                try:
+                    return await self._call_http_client(recovered_client, "request", method, url, **kwargs)
+                except Exception as recovered_exc:
+                    if not self._is_retryable_network_error(recovered_exc):
+                        raise
+                    exc = recovered_exc
 
             mode = self._proxy_mode()
             if (
@@ -686,7 +744,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                     )
                     await asyncio.sleep(0.5)
                     try:
-                        return await self._client.request(method, url, **kwargs)
+                        return await self._call_http_client(self._client, "request", method, url, **kwargs)
                     except Exception as retry_exc:
                         if not self._is_retryable_network_error(retry_exc):
                             raise
@@ -4532,7 +4590,8 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
             except Exception as exc:
                 self._debug(f"read image cache failed: {url} {exc}")
         try:
-            resp = await self._client.get(
+            resp = await self._call_http_client(
+                self._client, "get",
                 url,
                 timeout=self._news_image_timeout_sec(),
                 follow_redirects=True,
@@ -4681,7 +4740,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         max_bytes = 6_000_000
         for url in candidates:
             try:
-                resp = await self._client.get(url, timeout=self._header_download_timeout_sec())
+                resp = await self._call_http_client(self._client, "get", url, timeout=self._header_download_timeout_sec())
                 resp.raise_for_status()
                 if resp.headers.get("Content-Length"):
                     if int(resp.headers["Content-Length"]) > max_bytes:
