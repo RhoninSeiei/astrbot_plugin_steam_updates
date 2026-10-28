@@ -705,7 +705,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
     def _is_retryable_network_error(exc: Exception) -> bool:
         return isinstance(exc, httpx.RequestError | httpx.TimeoutException)
 
-    async def _request_with_network_fallback(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _request_with_network_fallback(self, method: str, url: str, *, retry_connect: bool = False, **kwargs: Any) -> httpx.Response:
         await self._ensure_http_client()
         if self._client is None:
             raise RuntimeError("http client not ready")
@@ -727,20 +727,24 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                     exc = recovered_exc
 
             mode = self._proxy_mode()
+            retry_errors = (
+                (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError)
+                if retry_connect else (httpx.ReadTimeout,)
+            )
             if (
                 mode == "custom"
                 and method.upper() in {"GET", "HEAD"}
-                and isinstance(exc, httpx.ReadTimeout)
+                and isinstance(exc, retry_errors)
             ):
                 # A slow response does not prove the proxy route is unusable.
                 # Retry safe reads within the configured budget before switching
-                # routes. Connection failures stop same-proxy retries early.
+                # routes. Only explicitly opted-in calls retry connect failures.
                 retries = self._proxy_read_timeout_retries()
                 for attempt in range(1, retries + 1):
                     self._log_warn(
-                        "network", "proxy read timed out, retrying same proxy",
+                        "network", "proxy request failed, retrying same proxy",
                         method=method.upper(), mode=mode,
-                        retry=attempt, max_retries=retries,
+                        retry=attempt, max_retries=retries, error_type=type(exc).__name__,
                     )
                     await asyncio.sleep(0.5)
                     try:
@@ -749,7 +753,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                         if not self._is_retryable_network_error(retry_exc):
                             raise
                         exc = retry_exc
-                        if not isinstance(retry_exc, httpx.ReadTimeout):
+                        if not isinstance(retry_exc, retry_errors):
                             break
             fallback_kind = ""
             fallback_kwargs: dict[str, Any] = {"trust_env": False}
@@ -897,17 +901,31 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
 
     def _llm_timeout_sec(self) -> int:
         try:
-            value = int(self._cfg("llm_timeout_sec", 30))
+            value = int(self._cfg("llm_timeout_sec", 90))
         except Exception:
-            value = 30
-        return max(5, min(value, 30))
+            value = 90
+        return max(5, min(value, 180))
 
     def _llm_round_timeout_sec(self) -> int:
         try:
-            value = int(self._cfg("llm_round_timeout_sec", 90))
+            value = int(self._cfg("llm_round_timeout_sec", 240))
         except (TypeError, ValueError):
+            value = 240
+        return max(30, min(value, 600))
+
+    def _free_games_timeout_sec(self) -> int:
+        try:
+            value = int(self._cfg("free_games_timeout_sec", 20))
+        except (TypeError, ValueError, OverflowError):
+            value = 20
+        return max(5, min(value, 60))
+
+    def _free_games_request_budget_sec(self) -> int:
+        try:
+            value = int(self._cfg("free_games_request_budget_sec", 90))
+        except (TypeError, ValueError, OverflowError):
             value = 90
-        return max(30, min(value, 300))
+        return max(20, min(value, 180))
 
     def _workshop_push_on_first_seen(self) -> bool:
         return bool(self._cfg("workshop_push_on_first_seen", False))
@@ -1937,10 +1955,14 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         if not self._client or not self._free_games_enabled():
             return []
         try:
-            resp = await self._request_with_network_fallback(
-                "GET",
-                FREE_GAMES_API,
-                timeout=10,
+            timeout = self._free_games_timeout_sec()
+            resp = await asyncio.wait_for(
+                self._request_with_network_fallback(
+                    "GET", FREE_GAMES_API,
+                    retry_connect=True,
+                    timeout=httpx.Timeout(timeout, connect=min(timeout, 15), pool=5),
+                ),
+                timeout=self._free_games_request_budget_sec(),
             )
             resp.raise_for_status()
             payload = resp.json()

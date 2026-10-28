@@ -31,8 +31,22 @@ class NetworkRouteRetryTest(unittest.IsolatedAsyncioTestCase):
         self.sleep_patch.start()
         self.addCleanup(self.sleep_patch.stop)
 
-    async def invoke(self, method='GET'):
-        return await self.p._request_with_network_fallback(method, 'https://example.test/news', params={'appid':'3092530'}, timeout=10)
+    async def invoke(self, method='GET', **options):
+        return await self.p._request_with_network_fallback(method, 'https://example.test/news', params={'appid':'3092530'}, timeout=10, **options)
+
+    async def test_opted_in_connection_timeout_retries_same_proxy(self):
+        self.request.side_effect = [httpx.ConnectTimeout('slow connect'), self.response]
+        self.assertIs(await self.invoke(retry_connect=True), self.response)
+        self.assertEqual(self.request.await_count, 2)
+        self.assertNotIn('retry_connect', self.request.await_args.kwargs)
+        self.fallback.assert_not_called()
+
+    async def test_opted_in_connection_errors_have_bounded_retries(self):
+        self.p.config['proxy_read_timeout_retries'] = 2
+        self.request.side_effect = httpx.ConnectError('unavailable')
+        self.assertIs(await self.invoke(retry_connect=True), self.response)
+        self.assertEqual(self.request.await_count, 3)
+        self.assertEqual(self.fallback_request.await_count, 1)
 
     async def test_success_does_not_retry(self):
         self.request.return_value = self.response

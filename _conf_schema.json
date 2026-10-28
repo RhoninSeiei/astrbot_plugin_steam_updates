@@ -226,6 +226,18 @@
         "default": true,
         "hint": "手动查询在当天没有普通游戏更新时，仍可只返回“限时免费领取”分区"
       },
+      "free_games_timeout_sec": {
+        "description": "免费领取接口响应超时(秒)",
+        "type": "int",
+        "default": 20,
+        "hint": "范围 5-60，默认 20；连接等待最多 15 秒，连接或读取失败时按代理重试次数重试"
+      },
+      "free_games_request_budget_sec": {
+        "description": "免费领取 API 总等待预算(秒)",
+        "type": "int",
+        "default": 90,
+        "hint": "范围 20-180，默认 90；包含接口重试和直连回退，耗尽后保留原状态并在下一轮再查询"
+      },
       "display_timezone": {
         "description": "免费领取时间显示时区",
         "type": "string",
@@ -344,10 +356,10 @@
         "hint": "示例：http://127.0.0.1:7890 或 socks5://127.0.0.1:7890（仅 proxy_mode=custom 生效）"
       },
       "proxy_read_timeout_retries": {
-        "description": "代理读取超时重试次数",
+        "description": "代理请求重试次数",
         "type": "int",
         "default": 3,
-        "hint": "范围 0-5，默认 3；不包含首次请求。0 表示关闭同代理重试。仅自定义代理的 GET、HEAD 读取超时生效，耗尽后尝试直连。"
+        "hint": "范围 0-5，默认 3；不包含首次请求。0 关闭同代理重试。适用于自定义代理 GET、HEAD 读取超时；免费领取接口额外重试连接失败，耗尽后尝试直连。"
       }
     }
   },
@@ -376,8 +388,8 @@
       "llm_timeout_sec": {
         "description": "LLM 请求超时(秒)",
         "type": "int",
-        "default": 30,
-        "hint": "范围 5-30，超时后回退到插件模式"
+        "default": 90,
+        "hint": "范围 5-180，默认 90；超过单次等待时间后使用原文并标注"
       },
       "llm_input_max_chars": {
         "description": "输入给 LLM 大模型的最大字数",
@@ -388,8 +400,8 @@
       "llm_round_timeout_sec": {
         "description": "单轮 LLM 总处理预算(秒)",
         "type": "int",
-        "default": 90,
-        "hint": "范围 30-300；预算耗尽后本轮剩余公告保留原文并标注，不再请求模型"
+        "default": 240,
+        "hint": "范围 30-600，默认 240；预算耗尽后本轮剩余公告保留原文并标注，不再请求模型"
       },
       "llm_prompt": {
         "description": "LLM 提示词",

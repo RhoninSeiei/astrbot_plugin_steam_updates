@@ -69,7 +69,7 @@
 
 ## 本地维护版
 
-当前版本为 `v1.3.7-local.6`，连接池耗尽时自动恢复，旧池等待并发请求结束后关闭；自定义代理读取超时默认重试 3 次，可在网络与代理设置中调整。
+当前版本为 `v1.3.7-local.7`，免费领取接口采用有限连接重试和总等待预算，模型单次等待默认 90 秒、整轮预算 240 秒；保留连接池自动恢复和五群独立订阅。
 
 本地继续使用 `font/YaHei.ttf` 和 `font/YaHei-Bold.ttc`，未替换为上游精简字体。字体资产不包含在独立上游订阅 PR 中。
 
@@ -103,10 +103,12 @@ AstrBot WebUI -> 插件 -> 插件配置
 | appdetails_retry_attempts | AppID 名称查询最大尝试次数，默认 `3`，范围 `1-5`；暂时性网络失败时每次间隔 2 秒重试 |
 | free_games_enable | 是否启用限时免费领取活动 |
 | free_games_manual_only_when_no_news | 手动查询在没有普通游戏更新时，是否仅返回“限时免费领取”分区 |
+| free_games_timeout_sec | 免费领取接口响应超时，默认 `20` 秒，范围 `5-60`；建连最多 `15` 秒 |
+| free_games_request_budget_sec | 免费领取 API 包含重试和回退的总等待预算，默认 `90` 秒，范围 `20-180` |
 | display_timezone | 免费领取截止时间显示时区；留空跟随容器系统时区，填写 IANA 时区名时按 UTC 活动源时间转换显示 |
 | proxy_mode | 代理模式：`off` / `system` / `custom` |
 | proxy_url | 自定义代理地址（仅 `custom` 生效） |
-| proxy_read_timeout_retries | 同代理读取超时重试次数，默认 `3`，范围 `0-5`，不包含首次请求；`0` 关闭同代理重试 |
+| proxy_read_timeout_retries | 同代理重试次数，默认 `3`，范围 `0-5`，不包含首次请求；免费领取接口额外覆盖连接失败，`0` 关闭重试 |
 | steam_appids | AppID 列表（如 `730`） |
 | workshop_enable | 是否启用创意工坊订阅监控 |
 | workshop_item_ids | 创意工坊订阅ID列表（PublishedFileID） |
@@ -124,9 +126,9 @@ AstrBot WebUI -> 插件 -> 插件配置
 | manual_query_workshop_command | 创意工坊手动查询指令（可配置多个） |
 | content_process_mode | 内容处理方式：`plugin` / `llm` |
 | llm_provider_id | LLM 提供商ID（可选，WebUI下拉选择） |
-| llm_timeout_sec | LLM 请求超时秒数（默认 `30`，范围 `5-30`，超时后回退到插件内置处理） |
+| llm_timeout_sec | LLM 单次请求等待时间（默认 `90` 秒，范围 `5-180`，超时后使用原文并标注） |
 | llm_input_max_chars | 单个游戏传给 LLM 的最大输入字数（默认 `8000`，范围 `1000-20000`；超出部分截断以控制模型输入量） |
-| llm_round_timeout_sec | 每轮 LLM 内容处理的总时间预算（默认 `90` 秒，范围 `30-300`；耗尽后剩余公告保留原文并标注） |
+| llm_round_timeout_sec | 每轮 LLM 总时间预算（默认 `240` 秒，范围 `30-600`；耗尽后剩余公告保留原文并标注） |
 | llm_prompt | LLM 提示词（仅 llm 模式生效） |
 | max_days | 每个游戏最多展示最近 N 天更新 |
 | content_max_chars | 单条公告正文最大字数 |
