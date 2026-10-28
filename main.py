@@ -683,7 +683,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 if key in getattr(self, "_retired_http_clients", {}):
                     await self._close_retired_http_client(client)
 
-    async def _recover_http_client_pool(self, failed_client):
+    async def _recover_http_client_pool(self, failed_client, request_label: str = ""):
         # Publish the replacement before awaiting cleanup. Concurrent failures
         # from the old generation share one replacement, without closing peers.
         if self._stop_event.is_set():
@@ -691,7 +691,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         if self._client is failed_client:
             self._client = self._build_http_client()
             self._client_signature = self._http_client_signature()
-            self._log_warn("network", "connection pool exhausted, replacing HTTP client")
+            self._log_warn("network", "connection pool exhausted, replacing HTTP client", request=request_label)
             await self._retire_http_client(failed_client)
         return self._client
 
@@ -705,7 +705,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
     def _is_retryable_network_error(exc: Exception) -> bool:
         return isinstance(exc, httpx.RequestError | httpx.TimeoutException)
 
-    async def _request_with_network_fallback(self, method: str, url: str, *, retry_connect: bool = False, **kwargs: Any) -> httpx.Response:
+    async def _request_with_network_fallback(self, method: str, url: str, *, retry_connect: bool = False, request_label: str = "", **kwargs: Any) -> httpx.Response:
         await self._ensure_http_client()
         if self._client is None:
             raise RuntimeError("http client not ready")
@@ -718,7 +718,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 raise
 
             if isinstance(exc, httpx.PoolTimeout) and method.upper() in {"GET", "HEAD"}:
-                recovered_client = await self._recover_http_client_pool(client)
+                recovered_client = await self._recover_http_client_pool(client, request_label=request_label)
                 try:
                     return await self._call_http_client(recovered_client, "request", method, url, **kwargs)
                 except Exception as recovered_exc:
@@ -745,6 +745,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                         "network", "proxy request failed, retrying same proxy",
                         method=method.upper(), mode=mode,
                         retry=attempt, max_retries=retries, error_type=type(exc).__name__,
+                        request=request_label,
                     )
                     await asyncio.sleep(0.5)
                     try:
@@ -777,6 +778,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 mode=mode,
                 fallback=fallback_kind,
                 error=self._exc_text(exc),
+                request=request_label,
             )
             fallback_limits = httpx.Limits(
                 max_connections=max(16, self._game_query_concurrency() * 2),
@@ -1960,6 +1962,7 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
                 self._request_with_network_fallback(
                     "GET", FREE_GAMES_API,
                     retry_connect=True,
+                    request_label="free_games",
                     timeout=httpx.Timeout(timeout, connect=min(timeout, 15), pool=5),
                 ),
                 timeout=self._free_games_request_budget_sec(),
@@ -2604,7 +2607,10 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         if api_key:
             params["key"] = api_key
         try:
-            resp = await self._request_with_network_fallback("GET", STEAM_NEWS_API, params=params, timeout=10)
+            resp = await self._request_with_network_fallback(
+                "GET", STEAM_NEWS_API, params=params, timeout=10,
+                retry_connect=True, request_label=f"steam_news:{appid}",
+            )
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
@@ -2745,7 +2751,10 @@ class SteamUpdatePush(SubscriptionPollingMixin, SubscriptionMixin, Star):
         params = {"l": self._steam_lang()}
         timeout = self._get_feed_timeout_sec()
         try:
-            resp = await self._request_with_network_fallback("GET", feed_url, params=params, timeout=timeout)
+            resp = await self._request_with_network_fallback(
+                "GET", feed_url, params=params, timeout=timeout,
+                retry_connect=True, request_label=f"steam_feed:{appid}",
+            )
             resp.raise_for_status()
             body = resp.text
         except Exception as exc:

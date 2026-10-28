@@ -1,7 +1,8 @@
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -19,6 +20,30 @@ class SteamNewsFilterTest(unittest.IsolatedAsyncioTestCase):
 
     def response(self, *, data=None, text=None):
         return httpx.Response(200, json=data, text=text, request=httpx.Request("GET", "https://example.test"))
+
+    async def assert_news_source_retries_connection(self, source, response):
+        self.p.config.update(proxy_mode='custom', proxy_url='http://proxy.test:7890')
+        request = AsyncMock(side_effect=[httpx.ConnectTimeout('temporary connection failure'), response])
+        self.p._client = SimpleNamespace(request=request)
+        self.p._ensure_http_client = AsyncMock()
+        direct = Mock()
+        direct.return_value.__aenter__ = AsyncMock(return_value=SimpleNamespace(request=AsyncMock(return_value=response)))
+        direct.return_value.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(self.m.httpx,'AsyncClient',direct), patch.object(self.m.asyncio,'sleep',AsyncMock()):
+            items = await getattr(self.p, source)('1049590',50)
+        self.assertEqual([i.gid for i in items], ['1847286114044216'])
+        self.assertEqual(request.await_count, 2)
+        direct.assert_not_called()
+
+    async def test_news_api_retries_connection_before_direct_fallback(self):
+        response = self.response(data={'appnews':{'newsitems':[
+            {'gid':'1847286114044216','url':self.url,'title':'Official','date':123,'contents':'Body','is_external_url':True}
+        ]}})
+        await self.assert_news_source_retries_connection('_fetch_news_api', response)
+
+    async def test_news_feed_retries_connection_before_direct_fallback(self):
+        response = self.response(text=f'<rss><channel><item><title>Official</title><link>{self.url}</link><description>Body</description></item></channel></rss>')
+        await self.assert_news_source_retries_connection('_fetch_news_feed', response)
 
     async def test_api_retains_official_announcement_marked_external(self):
         self.p._request_with_network_fallback = AsyncMock(return_value=self.response(data={

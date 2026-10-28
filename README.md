@@ -69,7 +69,7 @@
 
 ## 本地维护版
 
-当前版本为 `v1.3.7-local.7`，免费领取接口采用有限连接重试和总等待预算，模型单次等待默认 90 秒、整轮预算 240 秒；保留连接池自动恢复和五群独立订阅。
+当前版本为 `v1.3.7-local.8`，游戏新闻 API、Feed 与免费领取接口均支持有限连接重试；保留免费领取 API 总预算、模型处理预算、连接池自动恢复及五群独立订阅。
 
 本地继续使用 `font/YaHei.ttf` 和 `font/YaHei-Bold.ttc`，未替换为上游精简字体。字体资产不包含在独立上游订阅 PR 中。
 
@@ -108,7 +108,7 @@ AstrBot WebUI -> 插件 -> 插件配置
 | display_timezone | 免费领取截止时间显示时区；留空跟随容器系统时区，填写 IANA 时区名时按 UTC 活动源时间转换显示 |
 | proxy_mode | 代理模式：`off` / `system` / `custom` |
 | proxy_url | 自定义代理地址（仅 `custom` 生效） |
-| proxy_read_timeout_retries | 同代理重试次数，默认 `3`，范围 `0-5`，不包含首次请求；免费领取接口额外覆盖连接失败，`0` 关闭重试 |
+| proxy_read_timeout_retries | 同代理重试次数，默认 `3`，范围 `0-5`，不包含首次请求；游戏新闻 API、Feed 和免费领取接口均覆盖连接失败，`0` 关闭重试 |
 | steam_appids | AppID 列表（如 `730`） |
 | workshop_enable | 是否启用创意工坊订阅监控 |
 | workshop_item_ids | 创意工坊订阅ID列表（PublishedFileID） |
